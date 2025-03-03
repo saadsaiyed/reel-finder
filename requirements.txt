@@ -1,0 +1,8 @@
+flask
+requests
+flask-cors
+flask-session
+python-dotenv
+langchain-community
+sentence-transformers
+langchain_huggingface
