@@ -1,0 +1,15 @@
+*.pyc
+*.pyo
+*.pyd
+__pycache__
+.pytest_cache
+.git/
+.gitignore
+.gitmodules
+venv/
+desktop.ini
+.env
+data.json
+temp.*
+LICENSE
+
