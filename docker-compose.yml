@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .  # Use the current directory as the build context
+    ports:
+      - "5000:5000"
+    volumes:
+      - .:/app  # Mount local directory for faster development
+    env_file:
+      - .env  # Load environment variables from the .env file
+    environment:
+      - FLASK_ENV=development
+    command: ["waitress-serve", "--port=5000", "app:app"]
