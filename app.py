@@ -1,10 +1,11 @@
-import requests, os, secrets, uuid, time
+import requests, os, secrets, uuid, time, json
 import logging
 from flask import Flask, request
 from flask_cors import CORS
 from langchain_huggingface import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
+from qdrant_client.http.models import Filter, FieldCondition
 from pymongo.mongo_client import MongoClient
 from dotenv import load_dotenv
 
@@ -14,25 +15,21 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Create a new client and connect to the server
+# DB Connection
 db_connection_string = os.getenv("DB_CONNECTION_STRING")
 if db_connection_string is None or db_connection_string == "":
     logger.error("Please set the 'DB_CONNECTION_STRING' environment variable.")
     exit(1)
 
 client = MongoClient(str(db_connection_string))
+users = client["master"]["users"]
+if "users" not in client["master"].list_collection_names():
+    client["master"].create_collection(name="users", capped=False, autoIndexId=True)
+    logger.info(f"Created collection users.")
 
-db = client["master"]
-user_collection_name = "users"
 
-# Create collection if it doesn't exist
-users = db[user_collection_name]
-if user_collection_name not in db.list_collection_names():
-    db.create_collection(name=user_collection_name, capped=False, autoIndexId=True)
-    logger.info(f"Created collection '{user_collection_name}'.")
-
+# Fask config
 app = Flask(__name__)
-
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(16))  # Use env variable if available
 app.config['DEBUG'] = os.environ.get("FLASK_DEBUG")
 WEBHOOK_VERIFY_TOKEN = str(os.getenv('WEBHOOK_VERIFY_TOKEN'))
@@ -99,7 +96,8 @@ def webhook():
                                 "created_time": created_time
                             }
                             logger.info(f"Reel attachment received with payload: {payload}")
-                            store_embeddings(sender_id, [payload])
+                            # Have a logic of Using AI to describe the reel
+                            if not attachment.get('payload').get('title', '') == '': store_embeddings(sender_id, [payload])
                             users.insert_one(payload)
                             return 'EVENT_RECEIVED'
                         return 'EVENT_RECEIVED'
@@ -135,6 +133,14 @@ def get_similar_messages(collection_name, text):
     response = qdrant_client.query_points(
         collection_name=collection_name,
         query=embedding,
+        query_filter = Filter(
+            must=[
+                FieldCondition(
+                    key='sender_id',
+                    match="1303011334296915"
+                )
+            ]
+        ),
         limit=1
     )
     logger.info(f"Similar messages response: {response}")
@@ -171,6 +177,76 @@ def send_similar_reel(sender_id, text):
 @app.route('/')
 def home():
     return f"I am running on {app.config['ENV']} environment."
+
+@app.route("/conversations/<conversation_id>")
+def messages(conversation_id):
+    response = requests.get(f'https://graph.instagram.com/v22.0/{conversation_id}/messages?fields=attachments,id,message,from,to,created_time,reactions,shares&access_token={os.environ.get("INSTA_ACCESS_TOKEN")}')
+    response = response.json()
+    messages = response.get("data")
+    file_name = f'{messages[0].get("from").get("username")} {messages[0].get("to").get("data")[0].get("username")}'
+    with open(f"{file_name}.json", 'w') as f:
+        f.write(json.dumps(messages))
+    while "paging" in response: 
+        if response.get("paging").get("next"):
+            next_url = response.get("paging").get("next")
+            response = requests.get(next_url).json()
+            messages.extend(response.get("data"))
+        else: 
+            with open(f"{file_name}.json", 'w') as f:
+                f.write(json.dumps(messages))
+            break
+
+        logger.debug(f"File name: {file_name}")
+
+    print(len(messages))
+    embedding_msg=[]
+    for i, message in enumerate(messages):
+        if message.get("from").get("username") == "reel_sync_ai":
+            continue
+        if message.get("shares"):
+            link = message["shares"]["data"][0]["link"]
+            if i>0 and not messages[i-1].get("from").get("username") == "reel_sync_ai" and not messages[i-1].get("shares"):
+                prev_message = messages[i-1]
+                embedding_msg.append({
+                    "id" : prev_message.get("id"),
+                    "sender_id": prev_message.get("from").get("id"),
+                    "link" : link,
+                    "message" : prev_message.get("message"),
+                    "timestamp" : int(datetime.fromisoformat(prev_message.get("created_time")).timestamp() * 1000)
+                })
+
+    with open(f"{file_name} embeddings.json", 'w') as f:
+        f.write(json.dumps(embedding_msg))
+    
+    logger.debug("Starting Qdrant")
+    collection_name = prev_message.get("from").get("id")
+    qdrant_client = QdrantClient(url=os.environ.get("QDRANT_URL"), api_key=os.environ.get("QDRANT_API_KEY"))
+    try:
+        qdrant_client.get_collection(collection_name)
+    except:
+        qdrant_client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+        )
+    logger.debug(f"Found Collection {collection_name}")
+    embeddings_list = []
+    for message in embedding_msg:
+        embedding = EMBEDDING_MODEL.embed_query(message.get("message"))
+        embeddings_list.append({
+            "id": int(uuid.uuid4().int % (10**12)),  # Generate unique 12-digit ID
+            "vector": embedding,
+            "payload": message
+        })
+
+    logger.debug(f"Setting embeddings")
+    qdrant_client.upsert(
+        collection_name=collection_name,
+        points=embeddings_list
+    )
+    print("done")
+
+
+    return "DONE", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))

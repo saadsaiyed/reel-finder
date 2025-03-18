@@ -8,8 +8,10 @@ __pycache__
 .gitmodules
 venv/
 desktop.ini
+
 .env
-data.json
 temp.*
 LICENSE
-
+main.py
+data/
+README.md
