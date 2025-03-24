@@ -30,7 +30,9 @@ Making it easy for you to find correct reel when you need
 
 
 ## Docker Docs
+`docker-compose up --build`
 `docker build -t saadsaiyed7/reel-finder:latest .`
 `docker run -p 5000:5000 saadsaiyed7/reel-finder:latest`
 `docker run -p 5000:5000 --env-file .env saadsaiyed7/reel-finder:latest`
 `docker tag reel-finder-app:latest saadsaiyed7/reel-finder:latest`
+`docker push saadsaiyed7/reel-finder:latest`

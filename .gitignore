@@ -174,3 +174,4 @@ cython_debug/
 temp.*
 main.py
 data
+reel_collection

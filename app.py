@@ -1,17 +1,26 @@
-import requests, os, secrets, uuid, time, json
+VERSION="1.2.1"
+import requests, os, secrets, uuid, time, json, asyncio
 import logging
 from flask import Flask, request
 from flask_cors import CORS
 from langchain_huggingface import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
-from qdrant_client.http.models import Filter, FieldCondition
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 from pymongo.mongo_client import MongoClient
 from dotenv import load_dotenv
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from functions import gemini
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+pymongo_logger = logging.getLogger("pymongo")
+pymongo_logger.setLevel(logging.WARNING)
+
+logger.info(f"Launching version {VERSION}")
 
 load_dotenv()
 
@@ -36,8 +45,11 @@ WEBHOOK_VERIFY_TOKEN = str(os.getenv('WEBHOOK_VERIFY_TOKEN'))
 
 CORS(app=app)
 
-EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 qdrant_client = QdrantClient(url=os.environ.get("QDRANT_URL"), api_key=os.environ.get("QDRANT_API_KEY"))
+EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+logger.info(f"Finished Loading Embedding Model")
+executor = ThreadPoolExecutor(max_workers=5)
+logger.info(f"Finished Executor")
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
@@ -53,6 +65,7 @@ def webhook():
         body = request.get_json()
         logger.info(f"POST request received with body: {body}")
         if body.get('object') == 'instagram' and not body.get('entry')[0].get('messaging')[0].get('sender').get('id') == os.environ.get('IG_ID'):
+            tasks = []
             for entry in body.get('entry'):
                 for messaging in entry.get('messaging'):
                     created_time = entry.get('time')
@@ -62,11 +75,9 @@ def webhook():
 
                     if messaging.get('message') and messaging.get('message').get('text'):
                         text = messaging.get('message').get('text').lower()
-                        logger.info(f"Text message received: {text}")
                         if text.startswith("search"):
                             search_query = text.split("search")[1].strip()
-                            logger.info(f"Search initiated with query: {search_query}")
-                            response = send_similar_reel(sender_id, search_query)
+                            response = send_similar_reel(sender_id, search_query).get("message", "Message Not Found")
                             logger.info(f"Search response: {response}")
                             return 'EVENT_RECEIVED', 200
                         else:
@@ -87,20 +98,29 @@ def webhook():
                     elif messaging.get('message') and messaging.get('message').get('attachments'):
                         attachment = messaging.get('message').get('attachments')[0]
                         if attachment.get('type') == 'ig_reel':
-                            payload = {
-                                "sender_id": sender_id,
-                                "message": attachment.get('payload').get('title', ''),
-                                "mid": mid,
-                                "reel_id": attachment.get('payload').get('reel_video_id'),
-                                "link": attachment.get('payload').get('url'),
-                                "created_time": created_time
-                            }
-                            logger.info(f"Reel attachment received with payload: {payload}")
-                            # Have a logic of Using AI to describe the reel
-                            if not attachment.get('payload').get('title', '') == '': store_embeddings(sender_id, [payload])
-                            users.insert_one(payload)
-                            return 'EVENT_RECEIVED'
-                        return 'EVENT_RECEIVED'
+                            url = attachment.get('payload').get('url', '')
+                            tasks.append(executor.submit(run_gemini, url))
+            
+            for future in as_completed(tasks):
+                try:
+                    title = future.result()  # Get the result of the completed task
+                    logger.info(f"Task completed with result: {title}")
+                    payload = {
+                        "sender_id": sender_id,
+                        "message": title,
+                        "mid": mid,
+                        "reel_id": attachment.get('payload').get('reel_video_id'),
+                        "link": url,
+                        "created_time": created_time
+                    }
+                    logger.info(f"Reel attachment received with payload: {payload}")
+                    store_embeddings(sender_id, [payload])
+                    # Create a logic that deletes all the previous stored payloads on mongoDB
+                    users.insert_one(payload)
+                except Exception as e:
+                    logger.error(f"Error in task: {e}")
+                    return 'Error processing attachment', 500
+
         return 'EVENT_RECEIVED'
     return 'Invalid Request'
 
@@ -133,14 +153,14 @@ def get_similar_messages(collection_name, text):
     response = qdrant_client.query_points(
         collection_name=collection_name,
         query=embedding,
-        query_filter = Filter(
-            must=[
-                FieldCondition(
-                    key='sender_id',
-                    match="1303011334296915"
-                )
-            ]
-        ),
+        # query_filter = Filter(
+        #     must=[
+        #         FieldCondition(
+        #             key='sender_id',
+        #             match=MatchValue(value=collection_name)  # Wrap the value in MatchValue
+        #         )
+        #     ]
+        # ),
         limit=1
     )
     logger.info(f"Similar messages response: {response}")
@@ -170,16 +190,21 @@ def send_similar_reel(sender_id, text):
     response = requests.post(url, json=payload)
     if response.status_code != 200:
         logger.error(f"Error sending similar reel response")
-        return {"error": "Error sending similar reel response"}
-    return "Successfully sent similar reel response"
+        return {"message": "Error sending similar reel response"}
+    return {"message": "Successfully sent similar reel response"}
+
+def run_gemini(url):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop.run_until_complete(gemini(url))
 
 # new home rout that shows where I am
 @app.route('/')
 def home():
-    return f"I am running on {app.config['ENV']} environment."
+    return f"I am running."
 
 @app.route("/conversations/<conversation_id>")
-def messages(conversation_id):
+def messages(conversation_id): 
     response = requests.get(f'https://graph.instagram.com/v22.0/{conversation_id}/messages?fields=attachments,id,message,from,to,created_time,reactions,shares&access_token={os.environ.get("INSTA_ACCESS_TOKEN")}')
     response = response.json()
     messages = response.get("data")
@@ -244,7 +269,6 @@ def messages(conversation_id):
         points=embeddings_list
     )
     print("done")
-
 
     return "DONE", 200
 
