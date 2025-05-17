@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reel Finder</title>
+</head>
+<body>
+    <h1>Login using your account</h1>
+    <a href="{{ login_link }}" target="_blank" class="btn" style="display:inline-block;padding:10px 20px;background:#007bff;color:#fff;text-decoration:none;border-radius:4px;margin-bottom:15px;">Login with Provider</a>
+    <form id="loginForm" method="POST" action="/">
+        <input type="text" name="code" id="code" required>
+        <button type="submit">Submit</button>
+    </form>
+    <div id="response"></div>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const code = document.getElementById('code').value;
+            const responseDiv = document.getElementById('response');
+            responseDiv.textContent = 'Processing...';
+            try {
+                const res = await fetch('/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code })
+                });
+                const data = await res.json();
+                responseDiv.textContent = data.message || 'Success';
+            } catch (err) {
+                responseDiv.textContent = 'Error: ' + err.message;
+            }
+        });
+    </script>
+</body>
+</html>

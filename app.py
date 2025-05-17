@@ -13,6 +13,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from functions import gemini
+from flask import render_template
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,7 +23,7 @@ pymongo_logger.setLevel(logging.WARNING)
 
 logger.info(f"Launching version {VERSION}")
 
-load_dotenv()
+load_dotenv(override=True)
 
 # DB Connection
 db_connection_string = os.getenv("DB_CONNECTION_STRING")
@@ -39,11 +40,10 @@ if "users" not in client["master"].list_collection_names():
 
 # Fask config
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(16))  # Use env variable if available
-app.config['DEBUG'] = os.environ.get("FLASK_DEBUG")
-WEBHOOK_VERIFY_TOKEN = str(os.getenv('WEBHOOK_VERIFY_TOKEN'))
-
 CORS(app=app)
+
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(16))  # Use env variable if available
+app.config['DEBUG'] = True
 
 qdrant_client = QdrantClient(url=os.environ.get("QDRANT_URL"), api_key=os.environ.get("QDRANT_API_KEY"))
 EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -57,7 +57,7 @@ def webhook():
         verify_token = str(request.args.get('hub.verify_token'))
         challenge = request.args.get('hub.challenge')
         logger.info(f"GET request received with verify_token: {verify_token} and challenge: {challenge}")
-        if verify_token == WEBHOOK_VERIFY_TOKEN:
+        if verify_token == str(os.getenv('WEBHOOK_VERIFY_TOKEN')):
             return challenge
         else:
             return 'Invalid Request'
@@ -104,6 +104,12 @@ def webhook():
             for future in as_completed(tasks):
                 try:
                     title = future.result()  # Get the result of the completed task
+                    if title == "Gemini API quota exceeded":
+                        logger.error("Gemini API quota exceeded. Skipping this task.")
+                        continue
+                    if title == "Error running Gemini":
+                        logger.error("Error running Gemini for this task.")
+                        continue
                     logger.info(f"Task completed with result: {title}")
                     payload = {
                         "sender_id": sender_id,
@@ -175,6 +181,7 @@ def send_similar_reel(sender_id, text):
     # ToDo: send thumbs up reaction to the message
     
     link = response[0].payload.get("link", "No link available")
+    logging.info(f"Access_Token: {os.environ.get('INSTA_ACCESS_TOKEN')}")
     url = f"https://graph.instagram.com/v22.0/me/messages?access_token={os.environ.get('INSTA_ACCESS_TOKEN')}"
     payload = {
         "recipient": {"id": sender_id},
@@ -194,14 +201,48 @@ def send_similar_reel(sender_id, text):
     return {"message": "Successfully sent similar reel response"}
 
 def run_gemini(url):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    return loop.run_until_complete(gemini(url))
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(gemini(url))
+    except Exception as e:
+        # Handle Gemini API quota/resource exhaustion
+        if hasattr(e, 'response') and getattr(e.response, 'status_code', None) == 429:
+            logger.error(f"Gemini API quota exceeded: {e}")
+            return "Gemini API quota exceeded"
+        logger.error(f"Error in run_gemini: {e}")
+        return "Error running Gemini"
 
 # new home rout that shows where I am
-@app.route('/')
+@app.route('/', methods=["GET", "POST"])
 def home():
-    return f"I am running."
+    if request.method == "POST":
+        code = request.json.get("code")
+        logging.info(f"code URL: {code}")
+        code = code.split("?code=")[-1]
+        logging.info(f"code received: {code}")
+        client_id = os.environ.get("CLIENT_ID")
+        client_secret = os.environ.get("CLIENT_SECRET")
+        redirect_uri = os.environ.get("REDIRECT_URI")
+        grant_type = "authorization_code"
+
+        payload = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": grant_type,
+            "redirect_uri": redirect_uri,
+            "code": code
+        }
+
+        response = requests.post("https://api.instagram.com/oauth/access_token", data=payload)
+        logging.info(f"Instagram OAuth response: {response}")
+        json_response = response.json()
+        logging.info(f"Instagram OAuth response: {json_response}")
+        
+        return {"message": f"Access_Token {json_response['access_token']}"}, 200
+    
+    login_link = os.environ.get("LOGIN_URL", "#")
+    return render_template("index.html", login_link=login_link)
 
 @app.route("/conversations/<conversation_id>")
 def messages(conversation_id): 
@@ -273,5 +314,5 @@ def messages(conversation_id):
     return "DONE", 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)))
+    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)), debug=True)
 

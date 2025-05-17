@@ -45,7 +45,7 @@ async def gemini(url):
 
     # Generate content from the file
     response = client.models.generate_content(
-        model="gemini-1.5-pro",
+        model="gemini-2.0-flash",
         contents=[
             video_file,
             "with simple texts only, for each scene in this video, generate captions that describe the scene along with any spoken text placed in quotation marks wihtout timestamp. Provide your explanation. Only respond with what is asked. \nExample: A guy tasting something spicy and can't control his emotions and tears up."
