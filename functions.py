@@ -48,7 +48,7 @@ async def gemini(url):
         model="gemini-2.0-flash",
         contents=[
             video_file,
-            "with simple texts only, for each scene in this video, generate captions that describe the scene along with any spoken text placed in quotation marks wihtout timestamp. Provide your explanation. Only respond with what is asked. \nExample: A guy tasting something spicy and can't control his emotions and tears up."
+            "With simple texts only and no `here you go...` or `following is:...` types of statements, for each scene in this video, generate captions that describe the scene along with any spoken text placed in quotation marks wihtout timestamp. Provide your explanation. Only respond with what is asked. \nExample: A guy tasting something spicy and can't control his emotions and tears up."
         ]
     )
 
