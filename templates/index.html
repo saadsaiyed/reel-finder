@@ -6,6 +6,9 @@
     <title>Reel Finder</title>
 </head>
 <body>
+    {% if not login_link %}
+        <div style="color: green; margin-bottom: 15px;">Access token stored successfully.</div>
+    {% endif %}
     <h1>Login using your account</h1>
     <a href="{{ login_link }}" target="_blank" class="btn" style="display:inline-block;padding:10px 20px;background:#007bff;color:#fff;text-decoration:none;border-radius:4px;margin-bottom:15px;">Login with Provider</a>
     <form id="loginForm" method="POST" action="/">

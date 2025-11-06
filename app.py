@@ -1,4 +1,4 @@
-VERSION="1.2.2"
+VERSION="1.2.3"
 import requests, os, secrets, uuid, time, json, asyncio
 import logging
 from flask import Flask, request
@@ -16,7 +16,7 @@ from functions import gemini
 from flask import render_template
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 pymongo_logger = logging.getLogger("pymongo")
 pymongo_logger.setLevel(logging.WARNING)
@@ -36,20 +36,25 @@ users = client["master"]["users"]
 if "users" not in client["master"].list_collection_names():
     client["master"].create_collection(name="users", capped=False, autoIndexId=True)
     logger.info(f"Created collection users.")
-
+creds = client["master"]["creds"]
+if "creds" not in client["master"].list_collection_names():
+    client["master"].create_collection(name="creds", capped=False, autoIndexId=True)
+    logger.info(f"Created collection creds.")
 
 # Fask config
 app = Flask(__name__)
 CORS(app=app)
 
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(16))  # Use env variable if available
-app.config['DEBUG'] = True
+app.config['DEBUG'] = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
 
 qdrant_client = QdrantClient(url=os.environ.get("QDRANT_URL"), api_key=os.environ.get("QDRANT_API_KEY"))
 EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 logger.info(f"Finished Loading Embedding Model")
 executor = ThreadPoolExecutor(max_workers=5)
 logger.info(f"Finished Executor")
+
+logger.debug(f"IG_ID: {os.environ.get('IG_ID')}")
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
@@ -58,6 +63,7 @@ def webhook():
         sender_id = None
         mid = None
         future_to_context = {}
+        future = []
         if request.method == 'GET':
             verify_token = str(request.args.get('hub.verify_token'))
             challenge = request.args.get('hub.challenge')
@@ -91,17 +97,10 @@ def webhook():
                                 if user is None:
                                     time.sleep(5)
                                     user = users.find_one({"sender_id": sender_id})
-                                    if user is None:
-                                        logger.error("Cannot find reel for sender_id: {sender_id}")
-                                        send_error_message(sender_id, "If you want to search for a similar reel, please use the command `search <your query>`")
-                                        return 'CANT_FIND_REEL', 400
-                                
-                                current_time = int(datetime.now().timestamp() * 1000)
-                                if user.get("created_time") and current_time - user.get("created_time") < 1000 * 60 * 60:
-                                    logger.info(f"Too late to process message for sender_id: {sender_id}")
-                                    send_error_message(sender_id, "Too late to process your last reel. Please try to send the reel again with your message within 1hr.")
+                                if user is None or int(datetime.now().timestamp() * 1000) - user.get("created_time") > int(os.getenv("REEL_MESSAGE_TIMEOUT_MS", 60000)):
+                                    logger.error(f"Cannot find reel for sender_id: {sender_id}")
                                     send_error_message(sender_id, "If you want to search for a similar reel, please use the command `search <your query>`")
-                                    return 'EVENT_RECEIVED', 400
+                                    return 'CANT_FIND_REEL', 400
                                 
                                 user["message"] = text
                                 id = user.pop("_id", None)
@@ -113,55 +112,62 @@ def webhook():
                             attachment = messaging.get('message').get('attachments')[0]
                             if attachment.get('type') == 'ig_reel':
                                 url = attachment.get('payload').get('url', '')
-                                future.append(executor.submit(run_gemini, url))
-                                future_to_context[future] = {
+                                fut = executor.submit(run_gemini, url)
+                                future.append(fut)
+                                future_to_context[fut] = {
                                     "sender_id": sender_id,
                                     "mid": mid,
                                     "reel_id": attachment.get('payload').get('reel_video_id'),
                                     "created_time": created_time,
                                     "url": url
                                 }
+                                fut.add_done_callback(lambda f, ctx=future_to_context[fut]: process_gemini_result(f, ctx))
 
-                for future in as_completed(future_to_context):
-                    try:
-                        context = future_to_context[future]
-                        sender_id = context["sender_id"]
-                        mid = context["mid"]
-                        reel_id = context["reel_id"]
-                        created_time = context["created_time"]
-                        url = context["url"]
-                        
-                        title = future.result()  # Get the result of the completed task
-                        if title == "Gemini API quota exceeded":
-                            logger.error("Gemini API quota exceeded. Skipping this task.")
-                            send_error_message(sender_id, "Gemini API quota exceeded")
-                            continue
-                        if title == "Error running Gemini":
-                            logger.error("Error running Gemini for this task.")
-                            send_error_message(sender_id, "Error running Gemini")
-                            continue
-                        logger.info(f"Gemini response: {title}")
-                        payload = {
-                            "sender_id": sender_id,
-                            "message": title,
-                            "mid": mid,
-                            "reel_id": reel_id,
-                            "link": url,
-                            "created_time": created_time
-                        }
-                        response = store_embeddings(sender_id, [payload])
-                        if response.get("error"):
-                            logger.error(f"Error storing embeddings: {response.get('error')}")
-                            return 'Error processing attachment', 500
-                        users.delete_many({"sender_id": sender_id})
-                        users.insert_one(payload)
-                        send_error_message(sender_id, title)
-                        send_reaction(sender_id, mid, "love")
-                    except Exception as e:
-                        logger.error(f"Error in task: {e}")
-                        send_error_message(sender_id, str(e))
-                        return 'Error processing attachment', 500
+                return 'EVENT_RECEIVED'
             return 'EVENT_RECEIVED'
+        return 'Invalid Request'
+    except requests.RequestException as exc:
+        logging.error("Failed to update data: %s", exc)
+        send_error_message(sender_id, str(exc))
+
+def process_gemini_result(future, context):
+    sender_id = context["sender_id"]
+    mid = context["mid"]
+    reel_id = context["reel_id"]
+    created_time = context["created_time"]
+    url = context["url"]
+    try:
+        title = future.result()  # Get the result of the completed task
+        if title == "Gemini API quota exceeded":
+            logger.error("Gemini API quota exceeded. Skipping this task.")
+            send_error_message(sender_id, "Gemini API quota exceeded")
+            return
+        if title == "Error running Gemini":
+            logger.error("Error running Gemini for this task.")
+            send_error_message(sender_id, "Error running Gemini")
+            return
+        logger.info(f"Gemini response: {title}")
+        payload = {
+            "sender_id": sender_id,
+            "message": title,
+            "mid": mid,
+            "reel_id": reel_id,
+            "link": url,
+            "created_time": created_time
+        }
+        response = store_embeddings(sender_id, [payload])
+        if response.get("error"):
+            logger.error(f"Error storing embeddings: {response.get('error')}")
+            send_error_message(sender_id, "Error processing attachment")
+            return
+        users.delete_many({"sender_id": sender_id})
+        users.insert_one(payload)
+        send_error_message(sender_id, title)
+        send_reaction(sender_id, mid, "love")
+    except Exception as e:
+        logger.error(f"Error in task: {e}")
+        send_error_message(sender_id, str(e))
+
         return 'Invalid Request'
     except requests.RequestException as exc:
         logging.error("Failed to update data: %s", exc)
@@ -225,11 +231,13 @@ def send_similar_reel(sender_id, text):
         response = get_similar_messages(collection_name=sender_id, text=text)
         if not response or not response[0].payload:
             logger.info("No results found.")
+            send_error_message(sender_id, "No similar reels found. Try a different search query.")
             return {"error": "No similar messages found."}
+
         # ToDo: send thumbs up reaction to the message
         
         link = response[0].payload.get("link", "No link available")
-        url = f"https://graph.instagram.com/v22.0/me/messages?access_token={os.environ.get('INSTA_ACCESS_TOKEN')}"
+        url = f"https://graph.instagram.com/v22.0/me/messages?access_token={get_access_token()}"
         payload = {
             "recipient": {"id": sender_id},
             "message": {
@@ -256,7 +264,7 @@ def send_similar_reel(sender_id, text):
         return {"error": f"Error sending similar reel response: {exc}"}
         
 def send_error_message(sender_id, error_message):
-    url = f"https://graph.instagram.com/v22.0/me/messages?access_token={os.environ.get('INSTA_ACCESS_TOKEN')}"
+    url = f"https://graph.instagram.com/v22.0/me/messages?access_token={get_access_token()}"
     payload = {
         "recipient": {"id": sender_id},
         "message": {
@@ -268,8 +276,8 @@ def send_error_message(sender_id, error_message):
     if response.status_code != 200:
         logger.error(f"Error sending error message: {response.json()['error']['message']}")
 
-def send_reaction(sender_id, message_id, reaction_type="love"):
-    url = f"https://graph.instagram.com/v22.0/me/messages/?access_token={os.environ.get('INSTA_ACCESS_TOKEN')}"
+def send_reaction(sender_id, message_id, reaction_type=os.getenv("DEFAULT_REACTION_TYPE", "love")):
+    url = f"https://graph.instagram.com/v22.0/me/messages/?access_token={get_access_token()}"
     payload = {
         "recipient": {"id": sender_id},
         "sender_action": "react", # Or set to unreact to remove the reaction
@@ -300,33 +308,52 @@ def run_gemini(url):
 # new home rout that shows where I am
 @app.route('/', methods=["GET", "POST"])
 def home():
-    if request.method == "POST":
+    if request.method == "GET":
+        logging.info("GET request received for home page")
+        code = request.args.get("code")
+    elif request.method == "POST":
+        logging.info(f"POST request received with data: {request.json}")
         code = request.json.get("code")
-        logging.info(f"code URL: {code}")
         code = code.split("?code=")[-1]
-        logging.info(f"code received: {code}")
-        client_id = os.environ.get("CLIENT_ID")
-        client_secret = os.environ.get("CLIENT_SECRET")
-        redirect_uri = os.environ.get("REDIRECT_URI")
-        grant_type = "authorization_code"
-
-        payload = {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "grant_type": grant_type,
-            "redirect_uri": redirect_uri,
-            "code": code
-        }
-
-        response = requests.post("https://api.instagram.com/oauth/access_token", data=payload)
-        logging.info(f"Instagram OAuth response: {response}")
-        json_response = response.json()
-        logging.info(f"Instagram OAuth response: {json_response}")
-        
-        return {"message": f"Access_Token {json_response['access_token']}"}, 200
     
-    login_link = os.environ.get("LOGIN_URL", "#")
-    return render_template("index.html", login_link=login_link)
+    if not code or code=="":
+        logging.info("No code provided in GET request")
+        return render_template("index.html", login_link=os.environ.get("LOGIN_URL", "#"))
+
+    logging.info(f"code received: {code}")
+    client_id = os.environ.get("INSTA_CLIENT_ID")
+    client_secret = os.environ.get("INSTA_CLIENT_SECRET")
+    redirect_uri = os.environ.get("INSTA_REDIRECT_URI")
+    grant_type = "authorization_code"
+
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": grant_type,
+        "redirect_uri": redirect_uri,
+        "code": code
+    }
+
+    response = requests.post("https://api.instagram.com/oauth/access_token", data=payload)
+    json_response = response.json()
+    logging.info(f"Instagram OAuth response: {json_response}")
+    
+    creds.delete_many({})  # Clear existing credentials
+    creds.insert_one({
+        "access_token": json_response.get("access_token"),
+        "created_at": datetime.now()
+    })
+    if request.method == "POST":
+        return {"message": f"Access_Token {json_response['access_token']}"}, 200
+            
+    return render_template("index.html", login_link=None)
+
+def get_access_token():
+    """
+    Retrieves the Instagram access token from the database or environment variable.
+    If not found, returns None.
+    """
+    return list(creds.find())[0].get("access_token", os.getenv("INSTA_ACCESS_TOKEN"))
 
 @app.route('/reaction', methods=["GET"])
 def reaction():
@@ -334,7 +361,7 @@ def reaction():
 
 @app.route("/conversations/<conversation_id>")
 def messages(conversation_id): 
-    response = requests.get(f'https://graph.instagram.com/v22.0/{conversation_id}/messages?fields=attachments,id,message,from,to,created_time,reactions,shares&access_token={os.environ.get("INSTA_ACCESS_TOKEN")}')
+    response = requests.get(f'https://graph.instagram.com/v22.0/{conversation_id}/messages?fields=attachments,id,message,from,to,created_time,reactions,shares&access_token={get_access_token()}')
     response = response.json()
     messages = response.get("data")
     file_name = f'{messages[0].get("from").get("username")} {messages[0].get("to").get("data")[0].get("username")}'
@@ -403,5 +430,4 @@ def messages(conversation_id):
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)), debug=True)
-
 
