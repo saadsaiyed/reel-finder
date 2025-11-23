@@ -424,6 +424,57 @@ def send_reaction(sender_id, message_id, reaction_type=os.getenv("DEFAULT_REACTI
 
     return response.json()
 
+def exchange_for_long_lived_token(short_lived_token, client_id, client_secret):
+    """
+    Exchange short-lived token for long-lived token (60 days validity).
+    Uses Instagram Graph API ig_exchange_token endpoint.
+    """
+    try:
+        url = "https://graph.instagram.com/v22.0/oauth/access_token"
+        payload = {
+            "grant_type": "ig_exchange_token",
+            "client_secret": client_secret,
+            "access_token": short_lived_token
+        }
+        response = requests.post(url, params=payload)
+        response_data = response.json()
+        
+        if response.status_code != 200 or response_data.get("error"):
+            logger.error(f"Token exchange failed: {response_data}")
+            return {"error": response_data.get("error", {}).get("message", "Unknown error")}
+        
+        logger.info("Successfully exchanged short-lived token for long-lived token")
+        return response_data
+    except Exception as e:
+        logger.exception(f"Error exchanging token: {e}")
+        return {"error": str(e)}
+
+def get_access_token():
+    """
+    Retrieves the Instagram access token from the database or environment variable.
+    Checks expiration and logs warning if token is expiring soon.
+    If not found, returns env var as fallback.
+    """
+    try:
+        cred = list(creds.find())
+        if cred:
+            token_doc = cred[0]
+            access_token = token_doc.get("access_token")
+            expires_at = token_doc.get("expires_at")
+            
+            # Warn if token expiring soon (within 24 hours)
+            if expires_at:
+                time_until_expiry = (expires_at - datetime.now()).total_seconds()
+                if time_until_expiry < 86400:  # Less than 24 hours
+                    logger.warning(f"Access token expiring soon: {time_until_expiry / 3600:.1f} hours")
+            
+            return access_token
+    except Exception as e:
+        logger.error(f"Error retrieving access token from database: {e}")
+    
+    # Fallback to environment variable
+    return os.getenv("INSTA_ACCESS_TOKEN")
+
 def run_gemini(url):
     try:
         loop = asyncio.new_event_loop()
@@ -470,22 +521,286 @@ def home():
     json_response = response.json()
     logging.info(f"Instagram OAuth response: {json_response}")
     
-    creds.delete_many({})  # Clear existing credentials
+    # Store short-lived token temporarily
+    short_lived_token = json_response.get("access_token")
+    user_id = json_response.get("user_id")
+    
+    # Exchange short-lived token for long-lived token (60 days)
+    long_lived_response = exchange_for_long_lived_token(short_lived_token, client_id, client_secret)
+    if long_lived_response.get("error"):
+        logging.error(f"Failed to exchange for long-lived token: {long_lived_response.get('error')}")
+        return {"error": "Failed to obtain long-lived token"}, 400
+    
+    long_lived_token = long_lived_response.get("access_token")
+    expires_in = long_lived_response.get("expires_in", 60 * 24 * 60 * 60)  # Default 60 days in seconds
+    
+    # Store long-lived token in database
+    creds.delete_many({})
+    from datetime import timedelta
     creds.insert_one({
-        "access_token": json_response.get("access_token"),
-        "created_at": datetime.now()
+        "access_token": long_lived_token,
+        "user_id": user_id,
+        "expires_in": expires_in,
+        "created_at": datetime.now(),
+        "expires_at": datetime.now() + timedelta(seconds=expires_in),
+        "token_type": "long_lived"
     })
+    
     if request.method == "POST":
-        return {"message": f"Access_Token {json_response['access_token']}"}, 200
-            
+        return {"message": "Long-lived token obtained and stored successfully"}, 200
+    
     return render_template("index.html", login_link=None)
 
-def get_access_token():
+@app.route('/callback', methods=["GET"])
+def callback():
     """
-    Retrieves the Instagram access token from the database or environment variable.
-    If not found, returns None.
+    OAuth callback route - handles redirect from Instagram login.
+    Automatically exchanges authorization code for long-lived token.
+    Displays all token details including expiration info from Meta.
     """
-    return list(creds.find())[0].get("access_token", os.getenv("INSTA_ACCESS_TOKEN"))
+    try:
+        # Get authorization code from URL parameters
+        code = request.args.get("code")
+        
+        if not code:
+            logger.error("No authorization code in callback")
+            return {
+                "error": "No authorization code received from Instagram",
+                "status": "failed"
+            }, 400
+        
+        logger.info(f"OAuth callback received with code: {code[:20]}...")
+        
+        # Get credentials from environment
+        client_id = os.environ.get("INSTA_CLIENT_ID")
+        client_secret = os.environ.get("INSTA_CLIENT_SECRET")
+        redirect_uri = os.environ.get("INSTA_REDIRECT_URI")
+        
+        if not all([client_id, client_secret, redirect_uri]):
+            logger.error("Missing Instagram credentials in environment")
+            return {
+                "error": "Server configuration error - missing credentials",
+                "status": "failed"
+            }, 500
+        
+        # Step 1: Exchange code for short-lived access token
+        logger.info("Step 1: Exchanging authorization code for short-lived token...")
+        short_lived_payload = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+            "code": code
+        }
+        
+        short_lived_response = requests.post(
+            "https://api.instagram.com/oauth/access_token",
+            data=short_lived_payload
+        )
+        short_lived_data = short_lived_response.json()
+        
+        if short_lived_response.status_code != 200 or short_lived_data.get("error"):
+            logger.error(f"Failed to get short-lived token: {short_lived_data}")
+            return {
+                "error": "Failed to obtain short-lived token from Instagram",
+                "details": short_lived_data.get("error", {}),
+                "status": "failed"
+            }, 400
+        
+        short_lived_token = short_lived_data.get("access_token")
+        user_id = short_lived_data.get("user_id")
+        
+        logger.info(f"✓ Short-lived token obtained for user: {user_id}")
+        logger.debug(f"Short-lived response: {short_lived_data}")
+        
+        # Step 2: Exchange short-lived token for long-lived token (60 days)
+        logger.info("Step 2: Exchanging short-lived token for long-lived token...")
+        long_lived_response = exchange_for_long_lived_token(
+            short_lived_token,
+            client_id,
+            client_secret
+        )
+        
+        if long_lived_response.get("error"):
+            logger.error(f"Failed to exchange for long-lived token: {long_lived_response}")
+            return {
+                "error": "Failed to exchange for long-lived token",
+                "details": long_lived_response.get("error", {}),
+                "status": "failed"
+            }, 400
+        
+        long_lived_token = long_lived_response.get("access_token")
+        expires_in = long_lived_response.get("expires_in")  # In seconds
+        
+        logger.info(f"✓ Long-lived token obtained")
+        logger.debug(f"Long-lived response: {long_lived_response}")
+        
+        # Step 3: Calculate expiration details
+        from datetime import timedelta
+        expires_in_seconds = expires_in if expires_in else 60 * 24 * 60 * 60
+        expires_in_days = expires_in_seconds / (24 * 3600)
+        expires_at = datetime.now() + timedelta(seconds=expires_in_seconds)
+        
+        logger.info(f"Token expires in: {expires_in_days:.1f} days ({expires_in_seconds} seconds)")
+        
+        # Step 4: Store long-lived token in database with full metadata
+        creds.delete_many({})
+        token_record = {
+            "access_token": long_lived_token,
+            "user_id": user_id,
+            "expires_in": expires_in_seconds,
+            "expires_in_days": expires_in_days,
+            "created_at": datetime.now(),
+            "expires_at": expires_at,
+            "token_type": "long_lived",
+            "meta_response": long_lived_response,  # Store full Meta response
+            "short_lived_response": short_lived_data  # Also store short-lived for reference
+        }
+        
+        inserted = creds.insert_one(token_record)
+        logger.info(f"✓ Token stored in database with ID: {inserted.inserted_id}")
+        
+        # Step 5: Return comprehensive response with all details
+        response_data = {
+            "status": "success",
+            "message": "Long-lived token obtained and stored successfully",
+            "user_id": user_id,
+            "token_type": "long_lived",
+            "access_token": long_lived_token[:20] + "..." + long_lived_token[-20:],  # Masked for display
+            "expires_in": {
+                "seconds": expires_in_seconds,
+                "days": round(expires_in_days, 1),
+                "hours": round(expires_in_seconds / 3600, 1)
+            },
+            "expiration": {
+                "expires_at": expires_at.isoformat(),
+                "expires_at_readable": expires_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            },
+            "meta_response": {
+                "access_token_length": len(long_lived_token),
+                "expires_in": expires_in,
+                "user_id": long_lived_response.get("user_id"),
+                "token_type": long_lived_response.get("token_type")
+            },
+            "database": {
+                "stored_at": datetime.now().isoformat(),
+                "record_id": str(inserted.inserted_id)
+            }
+        }
+        
+        logger.info("=" * 80)
+        logger.info("TOKEN EXCHANGE COMPLETED SUCCESSFULLY")
+        logger.info("=" * 80)
+        logger.info(f"User ID: {user_id}")
+        logger.info(f"Token Type: Long-lived (60 days)")
+        logger.info(f"Expires In: {expires_in_days:.1f} days ({expires_in_seconds} seconds)")
+        logger.info(f"Expires At: {expires_at.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        logger.info(f"Token Length: {len(long_lived_token)} characters")
+        logger.info("=" * 80)
+        
+        return response_data, 200
+    
+    except Exception as e:
+        logger.exception(f"Unexpected error in callback: {e}")
+        return {
+            "error": "Internal server error during token exchange",
+            "details": str(e),
+            "status": "failed"
+        }, 500
+
+@app.route('/refresh-token', methods=["POST"])
+def refresh_token():
+    """
+    Refresh the long-lived token before it expires.
+    Should be called every 50 days or when token is close to expiration.
+    """
+    try:
+        cred = list(creds.find())
+        if not cred:
+            return {"error": "No token stored in database"}, 400
+        
+        token_doc = cred[0]
+        access_token = token_doc.get("access_token")
+        user_id = token_doc.get("user_id")
+        expires_at = token_doc.get("expires_at")
+        
+        # Check how much time is left
+        if expires_at:
+            time_until_expiry = (expires_at - datetime.now()).total_seconds()
+            if time_until_expiry > 24 * 60 * 60:  # More than 24 hours left
+                return {"message": f"Token still valid for {time_until_expiry / (24 * 3600):.1f} days"}, 200
+        
+        # Refresh token using refresh endpoint
+        url = "https://graph.instagram.com/v22.0/refresh_access_token"
+        payload = {
+            "grant_type": "ig_refresh_token",
+            "access_token": access_token
+        }
+        response = requests.post(url, params=payload)
+        response_data = response.json()
+        
+        if response.status_code != 200 or response_data.get("error"):
+            logger.error(f"Token refresh failed: {response_data}")
+            return {"error": response_data.get("error", {}).get("message", "Unknown error")}, 400
+        
+        new_token = response_data.get("access_token")
+        new_expires_in = response_data.get("expires_in", 60 * 24 * 60 * 60)
+        
+        # Update token in database
+        from datetime import timedelta
+        creds.update_one(
+            {"_id": token_doc.get("_id")},
+            {"$set": {
+                "access_token": new_token,
+                "expires_in": new_expires_in,
+                "created_at": datetime.now(),
+                "expires_at": datetime.now() + timedelta(seconds=new_expires_in),
+                "last_refreshed_at": datetime.now()
+            }}
+        )
+        
+        logger.info("Successfully refreshed long-lived token")
+        return {"message": "Token refreshed successfully", "expires_in_days": new_expires_in / (24 * 3600)}, 200
+    
+    except Exception as e:
+        logger.exception(f"Error refreshing token: {e}")
+        return {"error": str(e)}, 500
+
+@app.route('/token-status', methods=["GET"])
+def token_status():
+    """
+    Get the current status and expiration time of the stored token.
+    """
+    try:
+        cred = list(creds.find())
+        if not cred:
+            return {"status": "no_token", "message": "No token stored in database"}, 404
+        
+        token_doc = cred[0]
+        expires_at = token_doc.get("expires_at")
+        created_at = token_doc.get("created_at")
+        user_id = token_doc.get("user_id")
+        
+        if expires_at:
+            time_until_expiry = (expires_at - datetime.now()).total_seconds()
+            status = "valid" if time_until_expiry > 0 else "expired"
+            days_remaining = time_until_expiry / (24 * 3600)
+        else:
+            status = "unknown"
+            days_remaining = None
+        
+        return {
+            "status": status,
+            "user_id": user_id,
+            "created_at": created_at.isoformat() if created_at else None,
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "days_remaining": days_remaining,
+            "last_refreshed_at": token_doc.get("last_refreshed_at").isoformat() if token_doc.get("last_refreshed_at") else None
+        }, 200
+    
+    except Exception as e:
+        logger.exception(f"Error getting token status: {e}")
+        return {"error": str(e)}, 500
 
 @app.route('/reaction', methods=["GET"])
 def reaction():
