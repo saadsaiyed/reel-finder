@@ -427,20 +427,16 @@ def send_reaction(sender_id, message_id, reaction_type=os.getenv("DEFAULT_REACTI
 def exchange_for_long_lived_token(short_lived_token, client_id, client_secret):
     """
     Exchange short-lived token for long-lived token (60 days validity).
-    Uses Instagram Graph API ig_exchange_token endpoint.
+    Uses Instagram API ig_exchange_token endpoint.
+    Note: Must use api.instagram.com, NOT graph.instagram.com
     """
     try:
-        url = "https://graph.instagram.com/v22.0/oauth/access_token"
-        # Use data (POST body) not params (URL query string)
-        payload = {
-            "grant_type": "ig_exchange_token",
-            "client_secret": client_secret,
-            "access_token": short_lived_token
-        }
+        # IMPORTANT: Use api.instagram.com for token exchange, not graph.instagram.com
+        url = f"https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret={client_secret}&access_token={short_lived_token}"
         logger.debug(f"Token exchange request to: {url}")
         logger.debug(f"Token exchange payload keys: grant_type, client_secret, access_token")
         
-        response = requests.post(url, data=payload)
+        response = requests.get(url)
         response_data = response.json()
         
         logger.debug(f"Token exchange response status: {response.status_code}")
