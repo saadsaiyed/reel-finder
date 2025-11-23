@@ -1,4 +1,4 @@
-VERSION="1.2.3"
+VERSION="1.2.4"
 import requests, os, secrets, uuid, time, json, asyncio
 import logging
 from flask import Flask, request
@@ -36,6 +36,10 @@ users = client["master"]["users"]
 if "users" not in client["master"].list_collection_names():
     client["master"].create_collection(name="users", capped=False, autoIndexId=True)
     logger.info(f"Created collection users.")
+processed = client["master"]["processed_mids"]
+if "processed_mids" not in client["master"].list_collection_names():
+    client["master"].create_collection(name="processed_mids", capped=False)
+    logger.info(f"Created collection processed_mids.")
 creds = client["master"]["creds"]
 if "creds" not in client["master"].list_collection_names():
     client["master"].create_collection(name="creds", capped=False, autoIndexId=True)
@@ -54,81 +58,214 @@ logger.info(f"Finished Loading Embedding Model")
 executor = ThreadPoolExecutor(max_workers=5)
 logger.info(f"Finished Executor")
 
-logger.debug(f"IG_ID: {os.environ.get('IG_ID')}")
-
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
+    """Handle Instagram webhook verification and message processing."""
     try:
-        created_time = None
-        sender_id = None
-        mid = None
-        future_to_context = {}
-        future = []
         if request.method == 'GET':
             verify_token = str(request.args.get('hub.verify_token'))
             challenge = request.args.get('hub.challenge')
             logger.info(f"GET request received with verify_token: {verify_token} and challenge: {challenge}")
             if verify_token == str(os.getenv('WEBHOOK_VERIFY_TOKEN')):
                 return challenge
-            else:
-                return 'Invalid Request'
+            return 'Invalid verify_token', 403
+
         elif request.method == 'POST':
             body = request.get_json()
             logger.info(f"POST request received with body: {body}")
-            if body.get('object') == 'instagram' and not body.get('entry')[0].get('messaging')[0].get('sender').get('id') == os.environ.get('IG_ID'):
-                for entry in body.get('entry'):
-                    for messaging in entry.get('messaging'):
-                        created_time = entry.get('time')
-                        sender_id = messaging.get('sender').get('id')
-                        mid = messaging.get('message').get('mid')
-                        # ToDo: Handle message reactions
+            
+            # Validate webhook payload
+            if not body.get('object') == 'instagram':
+                return 'Invalid object type', 400
+                
+            try:
+                messaging = body['entry'][0]['messaging'][0]
+                sender_id = messaging['sender']['id']
+                
+                # Skip messages from ourselves
+                if sender_id == os.environ.get('IG_ID'):
+                    return 'EVENT_RECEIVED', 200
+                    
+                mid = messaging['message']['mid']
+                created_time = body['entry'][0].get('time')
+                
+                # Check for duplicate/already processed message
+                if processed.find_one({"mid": mid}):
+                    logger.info(f"Skipping already processed message {mid}")
+                    return 'EVENT_RECEIVED', 200
+                
+                message = messaging.get('message', {})
+                
+                # Handle text messages
+                if text := message.get('text'):
+                    text = text.lower()
+                    if text.startswith("search"):
+                        search_query = text.split("search", 1)[1].strip()
+                        executor.submit(handle_search, sender_id, search_query, mid)
+                        return 'EVENT_RECEIVED', 200
+                        
+                    # Handle description for previous reel
+                    user = users.find_one({"sender_id": sender_id})
+                    if not user:
+                        # THIS COULD BE THE ISSUE FOR SERVER KEEP GETTING WEBHOOK REQUEST FROM INSTA
+                        time.sleep(5)  # Brief retry
+                        user = users.find_one({"sender_id": sender_id})
+                    
+                    if not user:
+                        send_error_message(sender_id, "If you want to search for a similar reel, please use the command `search <your query>`")
+                        return 'EVENT_RECEIVED', 200
+                        
+                    current_time = int(datetime.now().timestamp() * 1000)
+                    if current_time - user.get("created_time", 0) > 1000 * 60 * 60:
+                        send_error_message(sender_id, "Too late to process your last reel. Please try to send the reel again with your message within 1hr.")
+                        send_error_message(sender_id, "If you want to search for a similar reel, please use the command `search <your query>`")
+                        users.delete_one({"sender_id": sender_id})
+                        return 'EVENT_RECEIVED', 200
+                        
+                    executor.submit(handle_reel_description, sender_id, user, text, mid)
+                    return 'EVENT_RECEIVED', 200
+                
+                # Handle attachments (reels)
+                if attachments := message.get('attachments'):
+                    attachment = attachments[0]
+                    if attachment.get('type') == 'ig_reel':
+                        url = attachment['payload'].get('url', '')
+                        context = {
+                            "sender_id": sender_id,
+                            "mid": mid,
+                            "reel_id": attachment['payload'].get('reel_video_id'),
+                            "created_time": created_time,
+                            "url": url
+                        }
+                        executor.submit(handle_attachment, context)
+                        return 'EVENT_RECEIVED', 200
+                
+                # Unhandled message type
+                logger.warning(f"Unhandled message type for mid {mid}")
+                return 'EVENT_RECEIVED', 200
+                
+            except (KeyError, IndexError) as e:
+                logger.error(f"Malformed webhook payload: {e}")
+                return 'Malformed payload', 400
+                
+        return 'Method not allowed', 405
+        
+    except Exception as exc:
+        logger.exception("Webhook error: %s", exc)
+        try:
+            if 'sender_id' in locals():
+                send_error_message(sender_id, "Internal error processing your message")
+        except:
+            pass
+        return 'Internal error', 500
 
-                        if messaging.get('message') and messaging.get('message').get('text'):
-                            text = messaging.get('message').get('text').lower()
-                            if text.startswith("search"):
-                                search_query = text.split("search")[1].strip()
-                                response = send_similar_reel(sender_id, search_query)
-                                if response.get('error'):
-                                    return 'Error processing search', 500
-                                logger.info(f"Search response: {response.json()}")
-                                return 'EVENT_RECEIVED', 200
-                            else:
-                                user = users.find_one({"sender_id": sender_id})
-                                if user is None:
-                                    time.sleep(5)
-                                    user = users.find_one({"sender_id": sender_id})
-                                if user is None or int(datetime.now().timestamp() * 1000) - user.get("created_time") > int(os.getenv("REEL_MESSAGE_TIMEOUT_MS", 60000)):
-                                    logger.error(f"Cannot find reel for sender_id: {sender_id}")
-                                    send_error_message(sender_id, "If you want to search for a similar reel, please use the command `search <your query>`")
-                                    return 'CANT_FIND_REEL', 400
-                                
-                                user["message"] = text
-                                id = user.pop("_id", None)
-                                store_embeddings(sender_id, [user])
-                                users.delete_one({"_id": id})
-                                send_reaction(sender_id, mid, "love")
-                            return 'EVENT_RECEIVED'
-                        elif messaging.get('message') and messaging.get('message').get('attachments'):
-                            attachment = messaging.get('message').get('attachments')[0]
-                            if attachment.get('type') == 'ig_reel':
-                                url = attachment.get('payload').get('url', '')
-                                fut = executor.submit(run_gemini, url)
-                                future.append(fut)
-                                future_to_context[fut] = {
-                                    "sender_id": sender_id,
-                                    "mid": mid,
-                                    "reel_id": attachment.get('payload').get('reel_video_id'),
-                                    "created_time": created_time,
-                                    "url": url
-                                }
-                                fut.add_done_callback(lambda f, ctx=future_to_context[fut]: process_gemini_result(f, ctx))
+def handle_search(sender_id, search_query, mid):
+    """Background worker: Process search request and send similar reel."""
+    try:
+        response = send_similar_reel(sender_id, search_query)
+        # response can be a dict with error info or a requests.Response on success
+        if isinstance(response, dict) and response.get('error'):
+            logger.error(f"Search error for mid {mid}: {response.get('error')}")
+            send_error_message(sender_id, "Error finding similar reel")
+            return
 
-                return 'EVENT_RECEIVED'
-            return 'EVENT_RECEIVED'
-        return 'Invalid Request'
-    except requests.RequestException as exc:
-        logging.error("Failed to update data: %s", exc)
-        send_error_message(sender_id, str(exc))
+        if isinstance(response, requests.Response):
+            # Try to parse JSON error if present
+            try:
+                json_resp = response.json()
+                if isinstance(json_resp, dict) and json_resp.get('error'):
+                    logger.error(f"Search error for mid {mid}: {json_resp.get('error')}")
+                    send_error_message(sender_id, "Error finding similar reel")
+                    return
+            except ValueError:
+                # Non-JSON response: treat non-2xx as error
+                if not (200 <= response.status_code < 300):
+                    logger.error(f"Search failed for mid {mid}: HTTP {response.status_code}")
+                    send_error_message(sender_id, "Error finding similar reel")
+                    return
+        elif not isinstance(response, dict):
+            # Unknown response type
+            logger.error(f"Unexpected response type for mid {mid}: {type(response)}")
+            send_error_message(sender_id, "Error finding similar reel")
+            return
+
+        logger.info(f"Search response for mid {mid}: {response}")
+        processed.insert_one({"mid": mid, "type": "search", "timestamp": int(datetime.now().timestamp() * 1000)})
+        send_reaction(sender_id, mid, "love")
+    except Exception as exc:
+        logger.exception(f"Error in handle_search for mid {mid}: {exc}")
+        send_error_message(sender_id, "Error processing search")
+
+def handle_reel_description(sender_id, user, text, mid):
+    """Background worker: Process text description for previously sent reel."""
+    try:
+        user["message"] = text
+        id = user.pop("_id", None)
+        response = store_embeddings(sender_id, [user])
+        if response.get("error"):
+            logger.error(f"Error storing embeddings for mid {mid}: {response.get('error')}")
+            send_error_message(sender_id, "Error storing your description")
+            return
+            
+        users.delete_one({"_id": id})
+        processed.insert_one({"mid": mid, "type": "description", "timestamp": int(datetime.now().timestamp() * 1000)})
+        send_reaction(sender_id, mid, "love")
+    except Exception as exc:
+        logger.exception(f"Error in handle_reel_description for mid {mid}: {exc}")
+        send_error_message(sender_id, "Error processing your description")
+
+def handle_attachment(context):
+    """Background worker: run Gemini, store embeddings, send messages/reactions and mark mid processed."""
+    sender_id = context.get("sender_id")
+    mid = context.get("mid")
+    url = context.get("url")
+    reel_id = context.get("reel_id")
+    created_time = context.get("created_time")
+    try:
+        # idempotency: skip if this mid already processed
+        if processed.find_one({"mid": mid}):
+            logger.info(f"Skipping already processed mid: {mid}")
+            return
+
+        title = run_gemini(url)
+        if title == "Gemini API quota exceeded":
+            logger.error("Gemini API quota exceeded for URL: %s", url)
+            send_error_message(sender_id, "Gemini API quota exceeded, try again later")
+            # mark as failed_quota to avoid immediate reprocessing
+            processed.insert_one({"mid": mid, "status": "failed_quota", "timestamp": int(datetime.now().timestamp() * 1000)})
+            return
+        if title == "Error running Gemini":
+            logger.error("Error running Gemini for URL: %s", url)
+            send_error_message(sender_id, "Error processing your reel, try again later")
+            return
+
+        payload = {
+            "sender_id": sender_id,
+            "message": title,
+            "mid": mid,
+            "reel_id": reel_id,
+            "link": url,
+            "created_time": created_time
+        }
+
+        response = store_embeddings(sender_id, [payload])
+        if response.get("error"):
+            logger.error("Error storing embeddings for mid %s: %s", mid, response.get("error"))
+            send_error_message(sender_id, "Error storing data, try again later")
+            return
+
+        users.delete_many({"sender_id": sender_id})
+        users.insert_one(payload)
+
+        # mark processed
+        processed.insert_one({"mid": mid, "timestamp": int(datetime.now().timestamp() * 1000)})
+
+        # notify user and react
+        send_error_message(sender_id, title)
+        send_reaction(sender_id, mid, "love")
+    except Exception as exc:
+        logger.exception("Exception in handle_attachment: %s", exc)
+        send_error_message(sender_id, "Internal error processing your reel")
 
 def process_gemini_result(future, context):
     sender_id = context["sender_id"]
@@ -165,13 +302,8 @@ def process_gemini_result(future, context):
         send_error_message(sender_id, title)
         send_reaction(sender_id, mid, "love")
     except Exception as e:
-        logger.error(f"Error in task: {e}")
+        logger.exception("Error in process_gemini_result: %s", e)
         send_error_message(sender_id, str(e))
-
-        return 'Invalid Request'
-    except requests.RequestException as exc:
-        logging.error("Failed to update data: %s", exc)
-        send_error_message(sender_id, str(exc))
 
 def store_embeddings(collection_name, messages):
     try:
