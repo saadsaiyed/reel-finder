@@ -431,13 +431,20 @@ def exchange_for_long_lived_token(short_lived_token, client_id, client_secret):
     """
     try:
         url = "https://graph.instagram.com/v22.0/oauth/access_token"
+        # Use data (POST body) not params (URL query string)
         payload = {
             "grant_type": "ig_exchange_token",
             "client_secret": client_secret,
             "access_token": short_lived_token
         }
-        response = requests.post(url, params=payload)
+        logger.debug(f"Token exchange request to: {url}")
+        logger.debug(f"Token exchange payload keys: grant_type, client_secret, access_token")
+        
+        response = requests.post(url, data=payload)
         response_data = response.json()
+        
+        logger.debug(f"Token exchange response status: {response.status_code}")
+        logger.debug(f"Token exchange response: {response_data}")
         
         if response.status_code != 200 or response_data.get("error"):
             logger.error(f"Token exchange failed: {response_data}")
