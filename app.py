@@ -480,18 +480,69 @@ def send_similar_reel(sender_id, text):
         logger.error(f"Error in send_similar_reel: {exc}")
         return {"error": f"Error sending similar reel response: {exc}"}
         
+def split_message(text, max_length=1000):
+    """
+    Split a long message into multiple chunks at word/sentence boundaries.
+    Tries to break at space or period, whichever is closer to max_length.
+    Returns a list of message chunks.
+    """
+    if len(text) <= max_length:
+        return [text]
+    
+    chunks = []
+    remaining = text
+    
+    while len(remaining) > max_length:
+        # Find the best break point within the last 200 chars of the max_length window
+        search_start = max(0, max_length - 200)
+        search_end = max_length
+        
+        # Look for period first (preferred)
+        last_period = remaining.rfind('.', search_start, search_end)
+        last_space = remaining.rfind(' ', search_start, search_end)
+        
+        # Choose the closest break point to max_length
+        if last_period >= search_start:
+            break_point = last_period + 1  # Include the period
+        elif last_space >= search_start:
+            break_point = last_space + 1  # Include the space
+        else:
+            # Fallback: just break at max_length
+            break_point = max_length
+        
+        chunks.append(remaining[:break_point].strip())
+        remaining = remaining[break_point:].strip()
+    
+    if remaining:
+        chunks.append(remaining)
+    
+    logger.debug(f"Split message into {len(chunks)} chunks: {[len(c) for c in chunks]}")
+    return chunks
+
 def send_error_message(sender_id, error_message):
-    url = f"https://graph.instagram.com/v22.0/me/messages?access_token={get_access_token()}"
-    payload = {
-        "recipient": {"id": sender_id},
-        "message": {
-            "text": error_message
+    """Send error message(s) to user, splitting into multiple messages if needed."""
+    # Split message if it exceeds 1000 characters
+    message_chunks = split_message(error_message, max_length=1000)
+    
+    for i, chunk in enumerate(message_chunks):
+        url = f"https://graph.instagram.com/v22.0/me/messages?access_token={get_access_token()}"
+        payload = {
+            "recipient": {"id": sender_id},
+            "message": {
+                "text": chunk
+            }
         }
-    }
-    logger.info(f"Request ready to send to URL `{url}` with payload: {payload}")
-    response = requests.post(url, json=payload)
-    if response.status_code != 200:
-        logger.error(f"Error sending error message: {response.json()['error']['message']}")
+        logger.info(f"Sending message chunk {i+1}/{len(message_chunks)} ({len(chunk)} chars)")
+        response = requests.post(url, json=payload)
+        if response.status_code != 200:
+            logger.error(f"Error sending message chunk {i+1}: {response.json()['error']['message']}")
+            return False
+        
+        # Small delay between messages to avoid rate limiting
+        if i < len(message_chunks) - 1:
+            time.sleep(0.2)
+    
+    return True
 
 def send_reaction(sender_id, message_id, reaction_type=os.getenv("DEFAULT_REACTION_TYPE", "love")):
     url = f"https://graph.instagram.com/v22.0/me/messages/?access_token={get_access_token()}"
