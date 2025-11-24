@@ -18,8 +18,12 @@ from flask import render_template
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-pymongo_logger = logging.getLogger("pymongo")
-pymongo_logger.setLevel(logging.WARNING)
+logging.getLogger("pymongo").setLevel(logging.WARNING)
+logging.getLogger("genai").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("google").setLevel(logging.WARNING)
+logging.getLogger("google.auth").setLevel(logging.WARNING)
+logging.getLogger("google.api_core").setLevel(logging.WARNING)
 
 logger.info(f"Launching version {VERSION}")
 
@@ -45,8 +49,6 @@ if "creds" not in client["master"].list_collection_names():
     client["master"].create_collection(name="creds", capped=False, autoIndexId=True)
     logger.info(f"Created collection creds.")
 
-
-
 # Fask config
 app = Flask(__name__)
 CORS(app=app)
@@ -58,15 +60,8 @@ qdrant_client = QdrantClient(url=os.environ.get("QDRANT_URL"), api_key=os.enviro
 EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 # EMBEDDING_MODEL = None
 logger.info(f"Finished Loading Embedding Model")
-executor = ThreadPoolExecutor(max_workers=5)
+executor = ThreadPoolExecutor(max_workers=10)
 logger.info(f"Finished Executor")
-
-# qdrant_client.create_payload_index(
-#     collection_name="2369537610112817", # Replace with your collection name
-#     field_name="mid",
-#     field_schema=PayloadSchemaType.KEYWORD
-# )
-
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
@@ -121,6 +116,50 @@ def webhook():
                         
                         try:
                             # Find the point by MID without requiring an index
+                            def find_point_by_mid(collection_name, target_mid):
+                                """Find a point in Qdrant by MID without requiring an index. Manually iterates through all points."""
+                                try:
+                                    logger.info(f"Searching for MID {target_mid[:50]}... in collection {collection_name}")
+                                    
+                                    # Scroll through all points in the collection
+                                    offset = 0
+                                    all_mids = []  # Track all MIDs for debugging
+                                    while True:
+                                        points, next_offset = qdrant_client.scroll(
+                                            collection_name=collection_name,
+                                            offset=offset,
+                                            limit=100,  # Fetch 100 at a time
+                                            with_payload=True,
+                                            with_vectors=False
+                                        )
+                                        
+                                        logger.debug(f"Scrolled batch: {len(points)} points, next_offset: {next_offset}")
+                                        
+                                        # Check each point for matching MID
+                                        for point in points:
+                                            point_mid = point.payload.get("mid")
+                                            all_mids.append(point_mid)
+                                            
+                                            if point_mid == target_mid:
+                                                logger.info(f"Found matching point for MID: {target_mid[:50]}...")
+                                                return point
+                                        
+                                        # If no more points, break
+                                        if next_offset is None or len(points) == 0:
+                                            break
+                                        
+                                        offset = next_offset
+                                    
+                                    logger.warning(f"No point found with MID: {target_mid[:50]}...")
+                                    logger.info(f"Available MIDs in collection ({len(all_mids)} total):")
+                                    for mid in all_mids[:10]:  # Show first 10
+                                        logger.info(f"  - {mid[:50]}... (full: {mid})")
+                                    return None
+                                    
+                                except Exception as e:
+                                    logger.exception(f"Error finding point by MID: {e}")
+                                    return None
+
                             found_point = find_point_by_mid(sender_id, replied_to_mid)
                             
                             if not found_point:
@@ -176,12 +215,13 @@ def webhook():
                             context = {
                                 "sender_id": sender_id,
                                 "mid": mid,
-                                "reel_id": attachment['payload'].get('reel_video_id') if attachement_type == 'ig_reel' else attachment['payload'].get('ig_post_media_id'),
+                                "reel_id": attachment['payload'].get('reel_video_id', None),
+                                "post_id": attachment['payload'].get('ig_post_media_id', None),
                                 "created_time": created_time,
                                 "url": url
                             }
                             executor.submit(handle_attachment, context)
-                            
+                            send_reaction(sender_id, mid, "love")
                             users.delete_many({"sender_id": sender_id})
                             users.insert_one({
                                 "sender_id": sender_id,
@@ -276,6 +316,7 @@ def handle_attachment(context):
     mid = context.get("mid")
     url = context.get("url")
     reel_id = context.get("reel_id")
+    post_id = context.get("post_id")
     created_time = context.get("created_time")
     try:
         # idempotency: skip if this mid already processed
@@ -283,7 +324,8 @@ def handle_attachment(context):
             logger.info(f"Skipping already processed mid: {mid}")
             return
 
-        title = run_gemini(url)
+        title = run_gemini(url, True if reel_id else False)
+        
         if title == "Gemini API quota exceeded":
             logger.error("Gemini API quota exceeded for URL: %s", url)
             send_error_message(sender_id, "Gemini API quota exceeded, try again later")
@@ -299,7 +341,7 @@ def handle_attachment(context):
             "sender_id": sender_id,
             "message": title,
             "mid": mid,
-            "reel_id": reel_id,
+            "reel_id": reel_id if reel_id else post_id,
             "link": url,
             "created_time": created_time
         }
@@ -320,43 +362,40 @@ def handle_attachment(context):
         logger.exception("Exception in handle_attachment: %s", exc)
         send_error_message(sender_id, "Internal error processing your reel")
 
-def process_gemini_result(future, context):
-    sender_id = context["sender_id"]
-    mid = context["mid"]
-    reel_id = context["reel_id"]
-    created_time = context["created_time"]
-    url = context["url"]
-    try:
-        title = future.result()  # Get the result of the completed task
-        if title == "Gemini API quota exceeded":
-            logger.error("Gemini API quota exceeded. Skipping this task.")
-            send_error_message(sender_id, "Gemini API quota exceeded")
-            return
-        if title == "Error running Gemini":
-            logger.error("Error running Gemini for this task.")
-            send_error_message(sender_id, "Error running Gemini")
-            return
-        logger.info(f"Gemini response: {title}")
-        payload = {
-            "sender_id": sender_id,
-            "message": title,
-            "mid": mid,
-            "reel_id": reel_id,
-            "link": url,
-            "created_time": created_time
-        }
-        response = store_embeddings(sender_id, [payload])
-        if response.get("error"):
-            logger.error(f"Error storing embeddings: {response.get('error')}")
-            send_error_message(sender_id, "Error processing attachment")
-            return
-        users.delete_many({"sender_id": sender_id})
-        users.insert_one(payload)
-        send_error_message(sender_id, title)
-        send_reaction(sender_id, mid, "love")
-    except Exception as e:
-        logger.exception("Error in process_gemini_result: %s", e)
-        send_error_message(sender_id, str(e))
+# def process_gemini_result(future, context):
+#     sender_id = context["sender_id"]
+#     mid = context["mid"]
+#     reel_id = context["reel_id"]
+#     created_time = context["created_time"]
+#     url = context["url"]
+#     try:
+#         title = future.result()  # Get the result of the completed task
+#         if title == "Gemini API quota exceeded":
+#             logger.error("Gemini API quota exceeded. Skipping this task.")
+#             send_error_message(sender_id, "Gemini API quota exceeded")
+#             return
+#         if title == "Error running Gemini":
+#             logger.error("Error running Gemini for this task.")
+#             send_error_message(sender_id, "Error running Gemini")
+#             return
+#         logger.info(f"Gemini response: {title}")
+#         payload = {
+#             "sender_id": sender_id,
+#             "message": title,
+#             "mid": mid,
+#             "reel_id": reel_id,
+#             "link": url,
+#             "created_time": created_time
+#         }
+#         response = store_embeddings(sender_id, [payload])
+#         if response.get("error"):
+#             logger.error(f"Error storing embeddings: {response.get('error')}")
+#             send_error_message(sender_id, "Error processing attachment")
+#             return
+#         send_error_message(sender_id, title)
+#     except Exception as e:
+#         logger.exception("Error in process_gemini_result: %s", e)
+#         send_error_message(sender_id, str(e))
 
 def store_embeddings(collection_name, messages):
     try:
@@ -402,50 +441,6 @@ def get_similar_messages(collection_name, text):
         logger.error(f"Error in get_similar_messages: {exc}")
         send_error_message(collection_name, str(exc))
         return {"error": f"Error retrieving similar messages: {exc}"}
-
-def find_point_by_mid(collection_name, target_mid):
-    """Find a point in Qdrant by MID without requiring an index. Manually iterates through all points."""
-    try:
-        logger.info(f"Searching for MID {target_mid[:50]}... in collection {collection_name}")
-        
-        # Scroll through all points in the collection
-        offset = 0
-        all_mids = []  # Track all MIDs for debugging
-        while True:
-            points, next_offset = qdrant_client.scroll(
-                collection_name=collection_name,
-                offset=offset,
-                limit=100,  # Fetch 100 at a time
-                with_payload=True,
-                with_vectors=False
-            )
-            
-            logger.debug(f"Scrolled batch: {len(points)} points, next_offset: {next_offset}")
-            
-            # Check each point for matching MID
-            for point in points:
-                point_mid = point.payload.get("mid")
-                all_mids.append(point_mid)
-                
-                if point_mid == target_mid:
-                    logger.info(f"Found matching point for MID: {target_mid[:50]}...")
-                    return point
-            
-            # If no more points, break
-            if next_offset is None or len(points) == 0:
-                break
-            
-            offset = next_offset
-        
-        logger.warning(f"No point found with MID: {target_mid[:50]}...")
-        logger.info(f"Available MIDs in collection ({len(all_mids)} total):")
-        for mid in all_mids[:10]:  # Show first 10
-            logger.info(f"  - {mid[:50]}... (full: {mid})")
-        return None
-        
-    except Exception as e:
-        logger.exception(f"Error finding point by MID: {e}")
-        return None
 
 def send_similar_reel(sender_id, text):
     try:
@@ -568,11 +563,11 @@ def get_access_token():
     # Fallback to environment variable
     return os.getenv("INSTA_ACCESS_TOKEN")
 
-def run_gemini(url):
+def run_gemini(url, is_reel):
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        return loop.run_until_complete(gemini(url))
+        return loop.run_until_complete(gemini(url, is_reel))
     except Exception as e:
         # Handle Gemini API quota/resource exhaustion
         if hasattr(e, 'response') and getattr(e.response, 'status_code', None) == 429:
