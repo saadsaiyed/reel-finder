@@ -1,4 +1,4 @@
-VERSION="1.2.4"
+VERSION="1.2.5"
 import requests, os, secrets, uuid, time, json, asyncio
 import logging
 from flask import Flask, request
@@ -6,7 +6,7 @@ from flask_cors import CORS
 from langchain_huggingface import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
-from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue, PayloadSchemaType
 from pymongo.mongo_client import MongoClient
 from dotenv import load_dotenv
 from datetime import datetime
@@ -45,6 +45,8 @@ if "creds" not in client["master"].list_collection_names():
     client["master"].create_collection(name="creds", capped=False, autoIndexId=True)
     logger.info(f"Created collection creds.")
 
+
+
 # Fask config
 app = Flask(__name__)
 CORS(app=app)
@@ -54,9 +56,17 @@ app.config['DEBUG'] = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
 
 qdrant_client = QdrantClient(url=os.environ.get("QDRANT_URL"), api_key=os.environ.get("QDRANT_API_KEY"))
 EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+# EMBEDDING_MODEL = None
 logger.info(f"Finished Loading Embedding Model")
 executor = ThreadPoolExecutor(max_workers=5)
 logger.info(f"Finished Executor")
+
+# qdrant_client.create_payload_index(
+#     collection_name="2369537610112817", # Replace with your collection name
+#     field_name="mid",
+#     field_schema=PayloadSchemaType.KEYWORD
+# )
+
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
@@ -80,21 +90,19 @@ def webhook():
                 
             try:
                 messaging = body['entry'][0]['messaging'][0]
-                sender_id = messaging['sender']['id']
-                
+                sender_id = messaging['sender']['id']                    
+                mid = messaging['message']['mid']
+                created_time = body['entry'][0].get('time')
+                message = messaging.get('message', {})
+
                 # Skip messages from ourselves
                 if sender_id == os.environ.get('IG_ID'):
                     return 'EVENT_RECEIVED', 200
-                    
-                mid = messaging['message']['mid']
-                created_time = body['entry'][0].get('time')
-                
+
                 # Check for duplicate/already processed message
                 if processed.find_one({"mid": mid}):
                     logger.info(f"Skipping already processed message {mid}")
                     return 'EVENT_RECEIVED', 200
-                
-                message = messaging.get('message', {})
                 
                 # Handle text messages
                 if text := message.get('text'):
@@ -103,6 +111,41 @@ def webhook():
                         search_query = text.split("search", 1)[1].strip()
                         executor.submit(handle_search, sender_id, search_query, mid)
                         return 'EVENT_RECEIVED', 200
+                    
+                    if message.get('reply_to'):
+                        # PROCESS THIS by SEARCHING IN QDRANT USING MID AS A METADATA
+                        replied_to_mid = message.get('reply_to').get('mid')
+                        logger.info(f"Looking for replied-to MID: {replied_to_mid[:50]}...")
+                        logger.debug(f"Full replied-to MID: {replied_to_mid}")
+                        logger.debug(f"Current message MID: {mid}")
+                        
+                        try:
+                            # Find the point by MID without requiring an index
+                            found_point = find_point_by_mid(sender_id, replied_to_mid)
+                            
+                            if not found_point:
+                                logger.warning(f"No points found for replied-to MID: {replied_to_mid}")
+                                send_error_message(sender_id, "Cannot add context to the message you replied to. Reel Not Found using reply_to.")
+                                return 'EVENT_RECEIVED', 200
+                            
+                            # Extract payload from the found point
+                            found_payload = found_point.payload
+                            logger.info(f"Found point with payload: {found_payload}")
+                            
+                            store_embeddings(sender_id, [{
+                                "sender_id": sender_id,
+                                "message": text,
+                                "mid": mid,
+                                "reel_id": found_payload.get("reel_id"),
+                                "link": found_payload.get("link"),
+                                "created_time": created_time
+                            }])
+                            return 'EVENT_RECEIVED', 200
+                            
+                        except Exception as e:
+                            logger.exception(f"Error searching for replied-to MID {replied_to_mid}: {e}")
+                            send_error_message(sender_id, f"Error processing reply: {str(e)}")
+                            return 'EVENT_RECEIVED', 200
                         
                     # Handle description for previous reel
                     user = users.find_one({"sender_id": sender_id})
@@ -110,10 +153,9 @@ def webhook():
                         # THIS COULD BE THE ISSUE FOR SERVER KEEP GETTING WEBHOOK REQUEST FROM INSTA
                         time.sleep(5)  # Brief retry
                         user = users.find_one({"sender_id": sender_id})
-                    
-                    if not user:
-                        send_error_message(sender_id, "If you want to search for a similar reel, please use the command `search <your query>`")
-                        return 'EVENT_RECEIVED', 200
+                        if not user:
+                            send_error_message(sender_id, "If you want to search for a similar reel, please use the command `search <your query>`")
+                            return 'EVENT_RECEIVED', 200
                         
                     current_time = int(datetime.now().timestamp() * 1000)
                     if current_time - user.get("created_time", 0) > 1000 * 60 * 60:
@@ -127,21 +169,35 @@ def webhook():
                 
                 # Handle attachments (reels)
                 if attachments := message.get('attachments'):
-                    attachment = attachments[0]
-                    if attachment.get('type') == 'ig_reel':
+                    for attachment in attachments:
+                        attachement_type = attachment.get('type')
                         url = attachment['payload'].get('url', '')
-                        context = {
-                            "sender_id": sender_id,
-                            "mid": mid,
-                            "reel_id": attachment['payload'].get('reel_video_id'),
-                            "created_time": created_time,
-                            "url": url
-                        }
-                        executor.submit(handle_attachment, context)
-                        return 'EVENT_RECEIVED', 200
-                
+                        if attachement_type in ['ig_reel', 'ig_post']:
+                            context = {
+                                "sender_id": sender_id,
+                                "mid": mid,
+                                "reel_id": attachment['payload'].get('reel_video_id') if attachement_type == 'ig_reel' else attachment['payload'].get('ig_post_media_id'),
+                                "created_time": created_time,
+                                "url": url
+                            }
+                            executor.submit(handle_attachment, context)
+                            
+                            users.delete_many({"sender_id": sender_id})
+                            users.insert_one({
+                                "sender_id": sender_id,
+                                "message": attachment['payload'].get('title', ''),
+                                "mid": mid,
+                                "reel_id": attachment['payload'].get('reel_video_id'),
+                                "link": url,
+                                "created_time": created_time
+                            })
+                            return 'EVENT_RECEIVED', 200
+                    send_error_message(sender_id, "Unsupported attachment type. Please send an Instagram reel.")
+                    return 'EVENT_RECEIVED', 200
                 # Unhandled message type
+                
                 logger.warning(f"Unhandled message type for mid {mid}")
+                send_error_message(sender_id, f"Unhandled message type.")
                 return 'EVENT_RECEIVED', 200
                 
             except (KeyError, IndexError) as e:
@@ -253,10 +309,7 @@ def handle_attachment(context):
             logger.error("Error storing embeddings for mid %s: %s", mid, response.get("error"))
             send_error_message(sender_id, "Error storing data, try again later")
             return
-
-        users.delete_many({"sender_id": sender_id})
-        users.insert_one(payload)
-
+        
         # mark processed
         processed.insert_one({"mid": mid, "timestamp": int(datetime.now().timestamp() * 1000)})
 
@@ -314,6 +367,7 @@ def store_embeddings(collection_name, messages):
                 collection_name=collection_name,
                 vectors_config=VectorParams(size=384, distance=Distance.COSINE)
             )
+            logger.info(f"Created new collection: {collection_name}")
     
         embeddings_list = []
         for message in messages:
@@ -341,14 +395,6 @@ def get_similar_messages(collection_name, text):
         response = qdrant_client.query_points(
             collection_name=collection_name,
             query=embedding,
-            # query_filter = Filter(
-            #     must=[
-            #         FieldCondition(
-            #             key='sender_id',
-            #             match=MatchValue(value=collection_name)  # Wrap the value in MatchValue
-            #         )
-            #     ]
-            # ),
             limit=1
         )
         return response.points
@@ -356,6 +402,50 @@ def get_similar_messages(collection_name, text):
         logger.error(f"Error in get_similar_messages: {exc}")
         send_error_message(collection_name, str(exc))
         return {"error": f"Error retrieving similar messages: {exc}"}
+
+def find_point_by_mid(collection_name, target_mid):
+    """Find a point in Qdrant by MID without requiring an index. Manually iterates through all points."""
+    try:
+        logger.info(f"Searching for MID {target_mid[:50]}... in collection {collection_name}")
+        
+        # Scroll through all points in the collection
+        offset = 0
+        all_mids = []  # Track all MIDs for debugging
+        while True:
+            points, next_offset = qdrant_client.scroll(
+                collection_name=collection_name,
+                offset=offset,
+                limit=100,  # Fetch 100 at a time
+                with_payload=True,
+                with_vectors=False
+            )
+            
+            logger.debug(f"Scrolled batch: {len(points)} points, next_offset: {next_offset}")
+            
+            # Check each point for matching MID
+            for point in points:
+                point_mid = point.payload.get("mid")
+                all_mids.append(point_mid)
+                
+                if point_mid == target_mid:
+                    logger.info(f"Found matching point for MID: {target_mid[:50]}...")
+                    return point
+            
+            # If no more points, break
+            if next_offset is None or len(points) == 0:
+                break
+            
+            offset = next_offset
+        
+        logger.warning(f"No point found with MID: {target_mid[:50]}...")
+        logger.info(f"Available MIDs in collection ({len(all_mids)} total):")
+        for mid in all_mids[:10]:  # Show first 10
+            logger.info(f"  - {mid[:50]}... (full: {mid})")
+        return None
+        
+    except Exception as e:
+        logger.exception(f"Error finding point by MID: {e}")
+        return None
 
 def send_similar_reel(sender_id, text):
     try:
@@ -805,10 +895,6 @@ def token_status():
         logger.exception(f"Error getting token status: {e}")
         return {"error": str(e)}, 500
 
-@app.route('/reaction', methods=["GET"])
-def reaction():
-    return send_reaction(sender_id=2369537610112817, message_id="aWdfZAG1faXRlbToxOklHTWVzc2FnZAUlEOjE3ODQxNDQ3MTkzMTQzMTMyOjM0MDI4MjM2Njg0MTcxMDMwMTI0NDI1OTgxOTQwOTIxNDA0MTg3ODozMjI1NTU4NDg4NTg2ODg0MTkxOTY0Nzg5NjQ5NDQwNzY4MAZDZD", reaction_type="LIKE")
-
 @app.route("/conversations/<conversation_id>")
 def messages(conversation_id): 
     response = requests.get(f'https://graph.instagram.com/v22.0/{conversation_id}/messages?fields=attachments,id,message,from,to,created_time,reactions,shares&access_token={get_access_token()}')
@@ -880,4 +966,3 @@ def messages(conversation_id):
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)), debug=True)
-
