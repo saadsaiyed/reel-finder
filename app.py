@@ -362,41 +362,6 @@ def handle_attachment(context):
         logger.exception("Exception in handle_attachment: %s", exc)
         send_error_message(sender_id, "Internal error processing your reel")
 
-# def process_gemini_result(future, context):
-#     sender_id = context["sender_id"]
-#     mid = context["mid"]
-#     reel_id = context["reel_id"]
-#     created_time = context["created_time"]
-#     url = context["url"]
-#     try:
-#         title = future.result()  # Get the result of the completed task
-#         if title == "Gemini API quota exceeded":
-#             logger.error("Gemini API quota exceeded. Skipping this task.")
-#             send_error_message(sender_id, "Gemini API quota exceeded")
-#             return
-#         if title == "Error running Gemini":
-#             logger.error("Error running Gemini for this task.")
-#             send_error_message(sender_id, "Error running Gemini")
-#             return
-#         logger.info(f"Gemini response: {title}")
-#         payload = {
-#             "sender_id": sender_id,
-#             "message": title,
-#             "mid": mid,
-#             "reel_id": reel_id,
-#             "link": url,
-#             "created_time": created_time
-#         }
-#         response = store_embeddings(sender_id, [payload])
-#         if response.get("error"):
-#             logger.error(f"Error storing embeddings: {response.get('error')}")
-#             send_error_message(sender_id, "Error processing attachment")
-#             return
-#         send_error_message(sender_id, title)
-#     except Exception as e:
-#         logger.exception("Error in process_gemini_result: %s", e)
-#         send_error_message(sender_id, str(e))
-
 def store_embeddings(collection_name, messages):
     try:
         try:
