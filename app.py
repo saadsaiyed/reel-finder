@@ -1,11 +1,11 @@
-VERSION = "1.2.5"
-import requests, os, secrets, uuid, json
-import logging
+VERSION = "1.2.6"
+import requests, os, secrets, uuid, json, logging
+from dotenv import load_dotenv
+load_dotenv(override=True)
 from flask import Flask, request, render_template
 from flask_cors import CORS
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
-from dotenv import load_dotenv
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -19,6 +19,7 @@ from functions import (
     run_gemini,
     users,
     processed,
+    unprocessed_mids,
     creds,
     EMBEDDING_MODEL,
 )
@@ -35,8 +36,6 @@ logging.getLogger("google.auth").setLevel(logging.WARNING)
 logging.getLogger("google.api_core").setLevel(logging.WARNING)
 
 logger.info(f"Launching version {VERSION}")
-
-load_dotenv(override=True)
 
 # Fask config
 app = Flask(__name__)
@@ -82,10 +81,20 @@ def webhook():
                     return "EVENT_RECEIVED", 200
 
                 # Check for duplicate/already processed message
-                if processed.find_one({"mid": mid}):
-                    logger.info(f"Skipping already processed message {mid}")
-                    return "EVENT_RECEIVED", 200
+                # if processed.find_one({"mid": mid}):
+                #     logger.info(f"Skipping already processed message {mid}")
+                #     return "EVENT_RECEIVED", 200
 
+                # Check if the user exists
+                user = users.find_one({"sender_id": sender_id})
+                if not user:
+                    users.insert_one(
+                        {
+                            "sender_id": sender_id,
+                            "created_time": created_time
+                        }
+                    )
+                
                 # Handle text messages
                 if text := message.get("text"):
                     replied_to_mid = message.get("reply_to", {}).get("mid")
@@ -97,6 +106,10 @@ def webhook():
                         created_time,
                         replied_to_mid,
                     )
+                    processed.insert_one(
+                        {"mid": mid, "type": "text", "timestamp": int(datetime.now().timestamp() * 1000)}
+                    )
+
                     return "EVENT_RECEIVED", 200
 
                 # Handle attachments (reels)
@@ -115,8 +128,10 @@ def webhook():
                             }
                             executor.submit(handle_attachment, context)
                             send_reaction(sender_id, mid, "love")
-                            users.delete_many({"sender_id": sender_id})
-                            users.insert_one(
+                            
+                            # Store reel info in unprocessed_mids for temporary storage
+                            unprocessed_mids.delete_many({"sender_id": sender_id})
+                            unprocessed_mids.insert_one(
                                 {
                                     "sender_id": sender_id,
                                     "message": attachment["payload"].get("title", ""),
@@ -272,7 +287,7 @@ def handle_attachment(context):
 
         # notify user and react
         send_error_message(sender_id, title)
-        send_reaction(sender_id, mid, "love")
+        # send_reaction(sender_id, mid, "love")
     except Exception as exc:
         logger.exception("Exception in handle_attachment: %s", exc)
         send_error_message(sender_id, "Internal error processing your reel")

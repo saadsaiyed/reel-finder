@@ -7,7 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install any needed packages specified in requirements.txt
-RUN pip install -r requirements.txt
+RUN pip install -r requirements.txt --no-cache-dir
 RUN pip install waitress
 
 # Copy the current directory contents into the container at /app

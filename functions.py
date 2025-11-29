@@ -19,6 +19,7 @@ db_client = MongoClient(str(db_connection_string))
 creds = db_client["master"]["creds"]
 users = db_client["master"]["users"]
 processed = db_client["master"]["processed_mids"]
+unprocessed_mids = db_client["master"]["unprocessed_mids"]
 
 # Initialize Qdrant client
 qdrant_client = QdrantClient(url=os.environ.get("QDRANT_URL"), api_key=os.environ.get("QDRANT_API_KEY"))
@@ -205,8 +206,6 @@ def send_similar_reel(sender_id, text):
             send_error_message(sender_id, "No similar reels found. Try a different search query.")
             return {"error": "No similar messages found."}
 
-        # ToDo: send thumbs up reaction to the message
-        
         link = response[0].payload.get("link", "No link available")
         url = f"https://graph.instagram.com/v22.0/me/messages?access_token={get_access_token()}"
         payload = {
@@ -372,7 +371,7 @@ def run_gemini(url, is_reel):
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        return loop.run_until_.complete(gemini(url, is_reel))
+        return loop.run_until_complete(gemini(url, is_reel))
     except Exception as e:
         # Handle Gemini API quota/resource exhaustion
         if hasattr(e, 'response') and getattr(e.response, 'status_code', None) == 429:
@@ -380,3 +379,67 @@ def run_gemini(url, is_reel):
             return "Gemini API quota exceeded"
         logger.error(f"Error in run_gemini: {e}")
         return "Error running Gemini"
+    
+def find_point_by_mid(collection_name, target_mid):
+    """Find a point in Qdrant by MID without requiring an index. Manually iterates through all points."""
+    try:
+        logger.info(f"Searching for MID {target_mid[:50]}... in collection {collection_name}")
+        
+        offset = 0
+        all_mids = []  # Track all MIDs for debugging
+        while True:
+            points, next_offset = qdrant_client.scroll(
+                collection_name=collection_name,
+                offset=offset,
+                limit=100,  # Fetch 100 at a time
+                with_payload=True,
+                with_vectors=False
+            )
+            
+            logger.debug(f"Scrolled batch: {len(points)} points, next_offset: {next_offset}")
+            
+            for point in points:
+                point_mid = point.payload.get("mid")
+                all_mids.append(point_mid)
+                
+                if point_mid == target_mid:
+                    logger.info(f"Found matching point for MID: {target_mid[:50]}...")
+                    return point
+            
+            if next_offset is None or len(points) == 0:
+                break
+            
+            offset = next_offset
+        
+        logger.warning(f"No point found with MID: {target_mid[:50]}...")
+        logger.info(f"Available MIDs in collection ({len(all_mids)} total):")
+        for mid_ in all_mids[:10]:
+            logger.info(f"  - {mid_[:50]}... (full: {mid_})")
+        return None
+        
+    except Exception as e:
+        logger.exception(f"Error finding point by MID: {e}")
+        return None
+
+def get_recent_conversations(sender_id):    
+    response = requests.get(
+        f'https://graph.instagram.com/v24.0/me/conversations?user_id={sender_id}&access_token={get_access_token()}'
+    )
+    conversation_id = response.json().get("data")[0].get("id")
+    
+    response = requests.get(
+        f"https://graph.instagram.com/v22.0/{conversation_id}/messages?fields=attachments,id,message,from,to,created_time,reactions,shares&access_token={get_access_token()}"
+    )
+    messages = response.json().get("data")
+    chat_entry = ""
+    counter = 0
+    for message in messages:
+        if message.get("message") is "":
+            continue
+        sender = "User" if message.get("from", {}).get("id") == sender_id else "Bot"
+        chat_entry = f"{sender}: {message.get('message')}\n"
+        counter += 1
+        if counter >= 25:
+            break
+        
+    return chat_entry
