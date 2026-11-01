@@ -296,21 +296,27 @@ def handle_attachment(context):
     reel_id = context.get("reel_id")
     post_id = context.get("post_id")
     created_time = context.get("created_time")
+
+    def fail(message):
+        # The reel never made it into the index, so drop the "describe your
+        # last reel" pointer too; otherwise the next text message attaches
+        # context to a reel that does not exist.
+        unprocessed_mids.delete_many({"mid": mid})
+        send_error_message(sender_id, message)
+        return False
+
     try:
         title = run_gemini(url, True if reel_id else False)
 
         if title == "Gemini API quota exceeded":
             logger.error("Gemini API quota exceeded for URL: %s", url)
-            send_error_message(sender_id, "Gemini API quota exceeded, try again later")
-            return False
+            return fail("Gemini API quota exceeded, try again later")
         if title == "Error running Gemini":
             logger.error("Error running Gemini for URL: %s", url)
-            send_error_message(sender_id, "Error processing your reel, try again later")
-            return False
+            return fail("Error processing your reel, try again later")
         if not title:
             logger.error("Gemini returned an empty description for URL: %s", url)
-            send_error_message(sender_id, "Could not describe that reel, try again later")
-            return False
+            return fail("Could not describe that reel, try again later")
 
         payload = {
             "sender_id": sender_id,
@@ -328,16 +334,14 @@ def handle_attachment(context):
             logger.error(
                 "Error storing embeddings for mid %s: %s", mid, response.get("error")
             )
-            send_error_message(sender_id, "Error storing data, try again later")
-            return False
+            return fail("Error storing data, try again later")
 
         # notify user and react
         send_error_message(sender_id, title)
         return True
     except Exception as exc:
         logger.exception("Exception in handle_attachment: %s", exc)
-        send_error_message(sender_id, "Internal error processing your reel")
-        return False
+        return fail("Internal error processing your reel")
 
 
 # new home rout that shows where I am
