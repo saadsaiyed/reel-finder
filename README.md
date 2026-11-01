@@ -27,3 +27,21 @@ Making it easy for you to find correct reel when you need
 
 1. Use the Instagram Graph API to fetch and manage messages.
 2. Refer to the [Instagram Graph API documentation](https://developers.facebook.com/docs/instagram-api) for detailed instructions on how to use the API to manage your Instagram inbox.
+
+
+## Docker
+
+```bash
+docker build -t saadsaiyed7/reel-finder:1.3.0 .
+docker run -p 5000:5000 --env-file .env saadsaiyed7/reel-finder:1.3.0
+```
+
+## Operations notes
+
+- `GET /token-status` reports how many days the Instagram token has left.
+  A background loop refreshes it automatically inside the last 7 days and
+  logs `CRITICAL` once it has expired.
+- `processed_mids.mid` is unique: each webhook `mid` is claimed once, so
+  Instagram retries cannot reprocess a reel.
+- Stored reel links expire. Search falls back to the saved description when
+  the original media URL no longer resolves.
