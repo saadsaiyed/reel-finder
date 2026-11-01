@@ -1,13 +1,12 @@
-VERSION = "1.2.6"
-import requests, os, secrets, uuid, json, logging
+VERSION = "1.3.0"
+import requests, os, secrets, logging, threading, time
 from dotenv import load_dotenv
 load_dotenv(override=True)
 from flask import Flask, request, render_template
 from flask_cors import CORS
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from pymongo.errors import DuplicateKeyError
 
 from functions import (
     store_embeddings,
@@ -17,11 +16,12 @@ from functions import (
     exchange_for_long_lived_token,
     get_access_token,
     run_gemini,
+    refresh_long_lived_token,
+    _is_permalink,
     users,
     processed,
     unprocessed_mids,
     creds,
-    EMBEDDING_MODEL,
 )
 from agent import handle_text_with_gemini_agent
 
@@ -47,6 +47,114 @@ app.config["DEBUG"] = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
 executor = ThreadPoolExecutor(max_workers=10)
 logger.info(f"Finished Executor")
 
+
+# --------------------------------------------------------------------------
+# Idempotency: each webhook mid is claimed atomically before work starts, so
+# Instagram's retries cannot process the same message twice. The claim is
+# released on failure so a retry can still succeed.
+# --------------------------------------------------------------------------
+
+def _ensure_indexes():
+    """Create the indexes the hot paths depend on. Safe to run on every boot."""
+    try:
+        # Drop duplicate idempotency markers so the unique index can be built.
+        for dupe in processed.aggregate([
+            {"$group": {"_id": "$mid", "ids": {"$push": "$_id"}, "n": {"$sum": 1}}},
+            {"$match": {"n": {"$gt": 1}}},
+        ]):
+            for extra_id in dupe["ids"][1:]:
+                processed.delete_one({"_id": extra_id})
+
+        processed.create_index("mid", unique=True, name="mid_unique")
+        users.create_index("sender_id", unique=True, name="sender_unique")
+        unprocessed_mids.create_index("sender_id", name="sender_idx")
+        logger.info("MongoDB indexes ready")
+    except Exception:
+        logger.exception("Failed to create MongoDB indexes")
+
+
+def _claim(mid):
+    """Atomically claim a mid. False means another delivery already has it."""
+    try:
+        processed.insert_one({
+            "mid": mid,
+            "status": "processing",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+        })
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+def _finish(mid, ok):
+    if not mid:
+        return
+    if ok:
+        processed.update_one(
+            {"mid": mid},
+            {"$set": {"status": "done",
+                      "finished_at": int(datetime.now().timestamp() * 1000)}},
+        )
+    else:
+        processed.delete_one({"mid": mid, "status": "processing"})
+
+
+def _release(mid):
+    processed.delete_one({"mid": mid, "status": "processing"})
+
+
+def _run_tracked(fn, *args, mid=None, **kwargs):
+    """Run a background handler and settle the claim from its return value."""
+    ok = False
+    try:
+        ok = fn(*args, **kwargs) is not False
+    except Exception:
+        logger.exception(f"Unhandled error in {fn.__name__} for mid {mid}")
+    finally:
+        _finish(mid, ok)
+
+
+# --------------------------------------------------------------------------
+# Token health: the 60-day token used to expire silently because nothing
+# refreshed it. This loop rolls it forward a week before expiry and shouts
+# when the token is already dead.
+# --------------------------------------------------------------------------
+
+def _token_health_loop(interval_seconds=6 * 3600):
+    while True:
+        try:
+            token_doc = creds.find_one()
+            if not token_doc:
+                logger.critical("No Instagram token stored; the bot cannot send DMs")
+            else:
+                expires_at = token_doc.get("expires_at")
+                if not isinstance(expires_at, datetime):
+                    logger.warning("Stored token has no expires_at; cannot schedule refresh")
+                else:
+                    days_left = (expires_at - datetime.now()).total_seconds() / 86400
+                    if days_left <= 0:
+                        logger.critical(
+                            f"Instagram token EXPIRED {abs(days_left):.1f} days ago. "
+                            "Re-authenticate at / to restore the bot."
+                        )
+                    elif days_left <= 7:
+                        logger.warning(f"Token expires in {days_left:.1f} days; refreshing")
+                        result = refresh_long_lived_token()
+                        if result.get("error"):
+                            logger.error(f"Automatic token refresh failed: {result['error']}")
+                        else:
+                            logger.info(f"Token refreshed; valid {result['days_remaining']} more days")
+                    else:
+                        logger.info(f"Instagram token valid for {days_left:.1f} more days")
+        except Exception:
+            logger.exception("Token health check failed")
+        time.sleep(interval_seconds)
+
+
+_ensure_indexes()
+threading.Thread(target=_token_health_loop, name="token-health", daemon=True).start()
+
+
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     """Handle Instagram webhook verification and message processing."""
@@ -62,182 +170,126 @@ def webhook():
             return "Invalid verify_token", 403
 
         elif request.method == "POST":
-            body = request.get_json()
+            body = request.get_json(silent=True) or {}
             logger.info(f"POST request received with body: {body}")
 
             # Validate webhook payload
             if not body.get("object") == "instagram":
                 return "Invalid object type", 400
 
-            try:
-                messaging = body["entry"][0]["messaging"][0]
-                sender_id = messaging["sender"]["id"]
-                mid = messaging["message"]["mid"]
-                created_time = body["entry"][0].get("time")
-                message = messaging.get("message", {})
+            # Instagram batches events: every entry and every messaging item
+            # must be handled. Reading entry[0].messaging[0] dropped the rest.
+            for entry in body.get("entry", []):
+                entry_time = entry.get("time")
+                for messaging in entry.get("messaging", []):
+                    try:
+                        _handle_messaging(messaging, entry_time)
+                    except (KeyError, IndexError) as e:
+                        logger.error(f"Malformed messaging event: {e}")
+                    except Exception:
+                        logger.exception("Unexpected error handling messaging event")
 
-                # Skip messages from ourselves
-                if sender_id == os.environ.get("IG_ID"):
-                    return "EVENT_RECEIVED", 200
-
-                # Check for duplicate/already processed message
-                # if processed.find_one({"mid": mid}):
-                #     logger.info(f"Skipping already processed message {mid}")
-                #     return "EVENT_RECEIVED", 200
-
-                # Check if the user exists
-                user = users.find_one({"sender_id": sender_id})
-                if not user:
-                    users.insert_one(
-                        {
-                            "sender_id": sender_id,
-                            "created_time": created_time
-                        }
-                    )
-                
-                # Handle text messages
-                if text := message.get("text"):
-                    replied_to_mid = message.get("reply_to", {}).get("mid")
-                    executor.submit(
-                        handle_text_with_gemini_agent,
-                        sender_id,
-                        text,
-                        mid,
-                        created_time,
-                        replied_to_mid,
-                    )
-                    processed.insert_one(
-                        {"mid": mid, "type": "text", "timestamp": int(datetime.now().timestamp() * 1000)}
-                    )
-
-                    return "EVENT_RECEIVED", 200
-
-                # Handle attachments (reels)
-                if attachments := message.get("attachments"):
-                    for attachment in attachments:
-                        attachement_type = attachment.get("type")
-                        url = attachment["payload"].get("url", "")
-                        if attachement_type in ["ig_reel", "ig_post"]:
-                            context = {
-                                "sender_id": sender_id,
-                                "mid": mid,
-                                "reel_id": attachment["payload"].get("reel_video_id", None),
-                                "post_id": attachment["payload"].get("ig_post_media_id", None),
-                                "created_time": created_time,
-                                "url": url,
-                            }
-                            executor.submit(handle_attachment, context)
-                            send_reaction(sender_id, mid, "love")
-                            
-                            # Store reel info in unprocessed_mids for temporary storage
-                            unprocessed_mids.delete_many({"sender_id": sender_id})
-                            unprocessed_mids.insert_one(
-                                {
-                                    "sender_id": sender_id,
-                                    "message": attachment["payload"].get("title", ""),
-                                    "mid": mid,
-                                    "reel_id": attachment["payload"].get("reel_video_id"),
-                                    "link": url,
-                                    "created_time": created_time,
-                                }
-                            )
-                            return "EVENT_RECEIVED", 200
-                    send_error_message(
-                        sender_id,
-                        "Unsupported attachment type. Please send an Instagram reel.",
-                    )
-                    return "EVENT_RECEIVED", 200
-                # Unhandled message type
-
-                logger.warning(f"Unhandled message type for mid {mid}")
-                send_error_message(sender_id, f"Unhandled message type.")
-                return "EVENT_RECEIVED", 200
-
-            except (KeyError, IndexError) as e:
-                logger.error(f"Malformed webhook payload: {e}")
-                return "Malformed payload", 400
+            return "EVENT_RECEIVED", 200
 
         return "Method not allowed", 405
 
     except Exception as exc:
         logger.exception("Webhook error: %s", exc)
-        try:
-            if "sender_id" in locals():
-                send_error_message(sender_id, "Internal error processing your message")
-        except:
-            pass
         return "Internal error", 500
 
 
+def _handle_messaging(messaging, created_time):
+    sender_id = (messaging.get("sender") or {}).get("id")
+    message = messaging.get("message") or {}
+    mid = message.get("mid")
+
+    if not sender_id or not mid:
+        logger.warning("Messaging event without sender or mid; ignored")
+        return
+
+    # Skip messages from ourselves
+    if sender_id == os.environ.get("IG_ID"):
+        return
+
+    # Claim before doing anything: a duplicate delivery loses the race here.
+    if not _claim(mid):
+        logger.info(f"Skipping already claimed message {mid}")
+        return
+
+    try:
+        _dispatch(sender_id, message, mid, created_time)
+    except Exception:
+        _release(mid)
+        logger.exception(f"Failed to dispatch mid {mid}")
+
+
+def _dispatch(sender_id, message, mid, created_time):
+    text = message.get("text")
+    if text:
+        replied_to_mid = (message.get("reply_to") or {}).get("mid")
+        executor.submit(
+            _run_tracked,
+            handle_text_with_gemini_agent,
+            sender_id, text, mid, created_time, replied_to_mid,
+            mid=mid,
+        )
+        return
+
+    for attachment in message.get("attachments") or []:
+        if attachment.get("type") not in ("ig_reel", "ig_post"):
+            continue
+
+        payload = attachment.get("payload") or {}
+        url = payload.get("url", "")
+        context = {
+            "sender_id": sender_id,
+            "mid": mid,
+            "reel_id": payload.get("reel_video_id"),
+            "post_id": payload.get("ig_post_media_id"),
+            "created_time": created_time,
+            "url": url,
+        }
+        executor.submit(_run_tracked, handle_attachment, context, mid=mid)
+        send_reaction(sender_id, mid, "love")
+
+        unprocessed_mids.delete_many({"sender_id": sender_id})
+        unprocessed_mids.insert_one({
+            "sender_id": sender_id,
+            "message": payload.get("title", ""),
+            "mid": mid,
+            "reel_id": payload.get("reel_video_id"),
+            "link": url,
+            "link_kind": "permalink" if _is_permalink(url) else "cdn",
+            "created_time": created_time,
+        })
+        return
+
+    send_error_message(
+        sender_id, "Unsupported attachment type. Please send an Instagram reel."
+    )
+    _finish(mid, True)
+
+
 def handle_search(sender_id, search_query, mid):
-    """Background worker: Process search request and send similar reel."""
+    """Background worker: answer a search command. Returns True on success."""
     try:
         response = send_similar_reel(sender_id, search_query)
-        # response can be a dict with error info or a requests.Response on success
         if isinstance(response, dict) and response.get("error"):
             logger.error(f"Search error for mid {mid}: {response.get('error')}")
-            send_error_message(sender_id, "Error finding similar reel")
-            return
-
-        if isinstance(response, requests.Response):
-            # Try to parse JSON error if present
-            try:
-                json_resp = response.json()
-                if isinstance(json_resp, dict) and json_resp.get("error"):
-                    logger.error(
-                        f"Search error for mid {mid}: {json_resp.get('error')}"
-                    )
-                    send_error_message(sender_id, "Error finding similar reel")
-                    return
-            except ValueError:
-                # Non-JSON response: treat non-2xx as error
-                if not (200 <= response.status_code < 300):
-                    logger.error(
-                        f"Search failed for mid {mid}: HTTP {response.status_code}"
-                    )
-                    send_error_message(sender_id, "Error finding similar reel")
-                    return
-        elif not isinstance(response, dict):
-            # Unknown response type
-            logger.error(f"Unexpected response type for mid {mid}: {type(response)}")
-            send_error_message(sender_id, "Error finding similar reel")
-            return
+            # send_similar_reel already told the user what went wrong.
+            return False
 
         logger.info(f"Search response for mid {mid}: {response}")
-        processed.insert_one(
-            {"mid": mid, "type": "search", "timestamp": int(datetime.now().timestamp() * 1000)}
-        )
         send_reaction(sender_id, mid, "love")
+        return True
     except Exception as exc:
         logger.exception(f"Error in handle_search for mid {mid}: {exc}")
         send_error_message(sender_id, "Error processing search")
-
-
-def handle_reel_description(sender_id, user, text, mid):
-    """Background worker: Process text description for previously sent reel."""
-    try:
-        user["message"] = text
-        id = user.pop("_id", None)
-        response = store_embeddings(sender_id, [user])
-        if response.get("error"):
-            logger.error(
-                f"Error storing embeddings for mid {mid}: {response.get('error')}"
-            )
-            send_error_message(sender_id, "Error storing your description")
-            return
-
-        users.delete_one({"_id": id})
-        processed.insert_one(
-            {"mid": mid, "type": "description", "timestamp": int(datetime.now().timestamp() * 1000)}
-        )
-        send_reaction(sender_id, mid, "love")
-    except Exception as exc:
-        logger.exception(f"Error in handle_reel_description for mid {mid}: {exc}")
-        send_error_message(sender_id, "Error processing your description")
+        return False
 
 
 def handle_attachment(context):
-    """Background worker: run Gemini, store embeddings, send messages/reactions and mark mid processed."""
+    """Background worker: describe the reel with Gemini, store it, reply."""
     sender_id = context.get("sender_id")
     mid = context.get("mid")
     url = context.get("url")
@@ -245,25 +297,20 @@ def handle_attachment(context):
     post_id = context.get("post_id")
     created_time = context.get("created_time")
     try:
-        # idempotency: skip if this mid already processed
-        if processed.find_one({"mid": mid}):
-            logger.info(f"Skipping already processed mid: {mid}")
-            return
-
         title = run_gemini(url, True if reel_id else False)
 
         if title == "Gemini API quota exceeded":
             logger.error("Gemini API quota exceeded for URL: %s", url)
             send_error_message(sender_id, "Gemini API quota exceeded, try again later")
-            # mark as failed_quota to avoid immediate reprocessing
-            processed.insert_one(
-                {"mid": mid, "status": "failed_quota", "timestamp": int(datetime.now().timestamp() * 1000)}
-            )
-            return
+            return False
         if title == "Error running Gemini":
             logger.error("Error running Gemini for URL: %s", url)
             send_error_message(sender_id, "Error processing your reel, try again later")
-            return
+            return False
+        if not title:
+            logger.error("Gemini returned an empty description for URL: %s", url)
+            send_error_message(sender_id, "Could not describe that reel, try again later")
+            return False
 
         payload = {
             "sender_id": sender_id,
@@ -271,6 +318,8 @@ def handle_attachment(context):
             "mid": mid,
             "reel_id": reel_id if reel_id else post_id,
             "link": url,
+            # CDN links are signed and expire; permalinks do not.
+            "link_kind": "permalink" if _is_permalink(url) else "cdn",
             "created_time": created_time,
         }
 
@@ -280,31 +329,34 @@ def handle_attachment(context):
                 "Error storing embeddings for mid %s: %s", mid, response.get("error")
             )
             send_error_message(sender_id, "Error storing data, try again later")
-            return
-
-        # mark processed
-        processed.insert_one({"mid": mid, "timestamp": int(datetime.now().timestamp() * 1000)})
+            return False
 
         # notify user and react
         send_error_message(sender_id, title)
-        # send_reaction(sender_id, mid, "love")
+        return True
     except Exception as exc:
         logger.exception("Exception in handle_attachment: %s", exc)
         send_error_message(sender_id, "Internal error processing your reel")
+        return False
 
 
 # new home rout that shows where I am
 @app.route("/", methods=["GET", "POST"])
 def home():
-    if request.method == "GET":
+    # HEAD is served by Flask for GET; request.method is "HEAD" there and used
+    # to leave `code` unbound, so initialise it up front.
+    code = None
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        logging.info(f"POST request received with data: {payload}")
+        code = payload.get("code")
+        if code:
+            code = code.split("?code=")[-1]
+    else:
         logging.info("GET request received for home page")
         code = request.args.get("code")
-    elif request.method == "POST":
-        logging.info(f"POST request received with data: {request.json}")
-        code = request.json.get("code")
-        code = code.split("?code=")[-1]
 
-    if not code or code == "":
+    if not code:
         logging.info("No code provided in GET request")
         return render_template("index.html", login_link=os.environ.get("LOGIN_URL", "#"))
 
@@ -531,62 +583,21 @@ def callback():
 @app.route("/refresh-token", methods=["POST"])
 def refresh_token():
     """
-    Refresh the long-lived token before it expires.
-    Should be called every 50 days or when token is close to expiration.
+    Force a token refresh / report remaining validity.
+    The background health loop also does this automatically a week before expiry.
     """
     try:
-        cred = list(creds.find())
-        if not cred:
+        token_doc = creds.find_one()
+        if not token_doc:
             return {"error": "No token stored in database"}, 400
 
-        token_doc = cred[0]
-        access_token = token_doc.get("access_token")
-        user_id = token_doc.get("user_id")
-        expires_at = token_doc.get("expires_at")
+        result = refresh_long_lived_token(force=True)
+        if result.get("error"):
+            return {"error": result["error"]}, 400
 
-        # Check how much time is left
-        if expires_at:
-            time_until_expiry = (expires_at - datetime.now()).total_seconds()
-            if time_until_expiry > 24 * 60 * 60:  # More than 24 hours left
-                return {
-                    "message": f"Token still valid for {time_until_expiry / (24 * 3600):.1f} days"
-                }, 200
-
-        # Refresh token using refresh endpoint
-        url = "https://graph.instagram.com/v22.0/refresh_access_token"
-        payload = {"grant_type": "ig_refresh_token", "access_token": access_token}
-        response = requests.post(url, params=payload)
-        response_data = response.json()
-
-        if response.status_code != 200 or response_data.get("error"):
-            logger.error(f"Token refresh failed: {response_data}")
-            return {
-                "error": response_data.get("error", {}).get("message", "Unknown error")
-            }, 400
-
-        new_token = response_data.get("access_token")
-        new_expires_in = response_data.get("expires_in", 60 * 24 * 60 * 60)
-
-        # Update token in database
-        from datetime import timedelta
-
-        creds.update_one(
-            {"_id": token_doc.get("_id")},
-            {
-                "$set": {
-                    "access_token": new_token,
-                    "expires_in": new_expires_in,
-                    "created_at": datetime.now(),
-                    "expires_at": datetime.now() + timedelta(seconds=new_expires_in),
-                    "last_refreshed_at": datetime.now(),
-                }
-            },
-        )
-
-        logger.info("Successfully refreshed long-lived token")
         return {
             "message": "Token refreshed successfully",
-            "expires_in_days": new_expires_in / (24 * 3600),
+            "expires_in_days": result.get("days_remaining"),
         }, 200
 
     except Exception as e:
@@ -633,86 +644,67 @@ def token_status():
 
 @app.route("/conversations/<conversation_id>")
 def messages(conversation_id):
-    response = requests.get(
-        f"https://graph.instagram.com/v22.0/{conversation_id}/messages?fields=attachments,id,message,from,to,created_time,reactions,shares&access_token={get_access_token()}"
-    )
-    response = response.json()
-    messages = response.get("data")
-    file_name = f'{messages[0].get("from").get("username")} {messages[0].get("to").get("data")[0].get("username")}'
-    with open(f"{file_name}.json", "w") as f:
-        f.write(json.dumps(messages))
-    while "paging" in response:
-        if response.get("paging").get("next"):
-            next_url = response.get("paging").get("next")
-            response = requests.get(next_url).json()
-            messages.extend(response.get("data"))
-        else:
-            with open(f"{file_name}.json", "w") as f:
-                f.write(json.dumps(messages))
-            break
+    """Developer utility: import a DM history and backfill the vector store.
 
-        logger.info(f"File name: {file_name}")
-
-    print(len(messages))
-    embedding_msg = []
-    for i, message in enumerate(messages):
-        if message.get("from").get("username") == "reel_sync_ai":
-            continue
-        if message.get("shares"):
-            link = message["shares"]["data"][0]["link"]
-            if (
-                i > 0
-                and not messages[i - 1].get("from").get("username") == "reel_sync_ai"
-                and not messages[i - 1].get("shares")
-            ):
-                prev_message = messages[i - 1]
-                embedding_msg.append(
-                    {
-                        "id": prev_message.get("id"),
-                        "sender_id": prev_message.get("from").get("id"),
-                        "link": link,
-                        "message": prev_message.get("message"),
-                        "timestamp": int(
-                            datetime.fromisoformat(
-                                prev_message.get("created_time")
-                            ).timestamp()
-                            * 1000
-                        ),
-                    }
-                )
-
-    with open(f"{file_name} embeddings.json", "w") as f:
-        f.write(json.dumps(embedding_msg))
-
-    logger.info("Starting Qdrant")
-    collection_name = prev_message.get("from").get("id")
-    qdrant_client = QdrantClient(
-        url=os.environ.get("QDRANT_URL"), api_key=os.environ.get("QDRANT_API_KEY")
-    )
+    Previously this wrote JSON files into the container's cwd and crashed with
+    NameError whenever no reel+description pair was found.
+    """
     try:
-        qdrant_client.get_collection(collection_name)
-    except:
-        qdrant_client.create_collection(
-            collection_name=collection_name,
-            vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-        )
-    logger.info(f"Found Collection {collection_name}")
-    embeddings_list = []
-    for message in embedding_msg:
-        embedding = EMBEDDING_MODEL.embed_query(message.get("message"))
-        embeddings_list.append(
-            {
-                "id": int(uuid.uuid4().int % (10**12)),  # Generate unique 12-digit ID
-                "vector": embedding,
-                "payload": message,
-            }
-        )
+        messages = []
+        url = f"https://graph.instagram.com/v22.0/{conversation_id}/messages"
+        params = {
+            "fields": "attachments,id,message,from,to,created_time,reactions,shares",
+            "access_token": get_access_token(),
+        }
+        for _ in range(10):  # bounded pagination
+            page = requests.get(url, params=params, timeout=30).json()
+            messages.extend(page.get("data") or [])
+            url = (page.get("paging") or {}).get("next")
+            params = None
+            if not url:
+                break
 
-    logger.info(f"Setting embeddings")
-    qdrant_client.upsert(collection_name=collection_name, points=embeddings_list)
-    print("done")
+        if not messages:
+            return {"error": "No messages returned for that conversation"}, 404
 
-    return "DONE", 200
+        imported = []
+        for i, message in enumerate(messages):
+            if (message.get("from") or {}).get("username") == "reel_sync_ai":
+                continue
+            shares = message.get("shares") or {}
+            link = ((shares.get("data") or [{}])[0]).get("link") if shares else None
+            if not link or i == 0:
+                continue
+            previous = messages[i - 1]
+            previous_sender = previous.get("from") or {}
+            if previous_sender.get("username") == "reel_sync_ai" or previous.get("shares"):
+                continue
+            if not previous.get("message"):
+                continue
+            imported.append({
+                "id": previous.get("id"),
+                "sender_id": previous_sender.get("id"),
+                "link": link,
+                "link_kind": "permalink" if _is_permalink(link) else "cdn",
+                "message": previous.get("message"),
+                "timestamp": int(
+                    datetime.fromisoformat(previous["created_time"]).timestamp() * 1000
+                ),
+            })
+
+        if not imported:
+            return {"message": "No reel + description pairs found",
+                    "scanned": len(messages)}, 200
+
+        collection_name = imported[0]["sender_id"]
+        for row in imported:
+            store_embeddings(collection_name, [row])
+
+        return {"message": "Imported", "pairs": len(imported),
+                "collection": collection_name}, 200
+    except Exception as exc:
+        logger.exception(f"Error importing conversation: {exc}")
+        return {"error": str(exc)}, 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)), debug=True)
