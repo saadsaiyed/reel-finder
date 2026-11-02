@@ -3,6 +3,15 @@
 The old Meta app is out of use. This is the configuration for the new app, and
 the reasoning behind the code that keeps the access token alive.
 
+## Which setup to use
+
+For a single-account bot, use **Instagram API with Instagram login**:
+`graph.instagram.com`, an Instagram user token, no Facebook Page, no system
+user, no business asset assignment. That is what the code defaults to
+(`GRAPH_BASE` unset). Section 5 covers the Facebook Login variant, which needs a
+Page, a system user and Business Verification — only worth it if you already
+have that infrastructure.
+
 ## 1. Create the app
 
 1. <https://developers.facebook.com/apps> → **Create app**.
