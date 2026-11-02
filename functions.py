@@ -1,4 +1,4 @@
-import os, logging, time, asyncio, hashlib, tempfile, requests
+import os, logging, time, asyncio, hashlib, hmac, tempfile, requests
 from google import genai
 import uuid
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -232,7 +232,7 @@ def get_similar_messages(collection_name, text, limit=1):
 def _send_video(sender_id, link):
     response = requests.post(
         "https://graph.instagram.com/v22.0/me/messages",
-        params={"access_token": get_access_token()},
+        params=_auth_params(),
         json={
             "recipient": {"id": sender_id},
             "message": {"attachment": {"type": "video", "payload": {"url": link}}},
@@ -325,25 +325,47 @@ def split_message(text, max_length=1000):
     logger.debug(f"Split message into {len(chunks)} chunks: {[len(c) for c in chunks]}")
     return chunks
 
+def _auth_params():
+    """Graph API query params: the token plus appsecret_proof when configured.
+
+    appsecret_proof is an HMAC of the access token keyed by the app secret, so
+    a leaked token is useless without the secret as well.
+    """
+    token = get_access_token() or ""
+    params = {"access_token": token}
+    secret = os.environ.get("INSTA_APP_SECRET")
+    if secret and token:
+        params["appsecret_proof"] = hmac.new(
+            secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+    return params
+
+
 def send_error_message(sender_id, error_message):
     """Send error message(s) to user, splitting into multiple messages if needed."""
     # Split message if it exceeds 1000 characters
     message_chunks = split_message(error_message, max_length=1000)
-    
+
     for i, chunk in enumerate(message_chunks):
-        url = f"https://graph.instagram.com/v22.0/me/messages?access_token={get_access_token()}"
         payload = {
             "recipient": {"id": sender_id},
-            "message": {
-                "text": chunk
-            }
+            "message": {"text": chunk},
         }
         logger.info(f"Sending message chunk {i+1}/{len(message_chunks)} ({len(chunk)} chars)")
-        response = requests.post(url, json=payload)
+        response = requests.post(
+            "https://graph.instagram.com/v22.0/me/messages",
+            params=_auth_params(),
+            json=payload,
+            timeout=30,
+        )
         if response.status_code != 200:
-            logger.error(f"Error sending message chunk {i+1}: {response.json()['error']['message']}")
+            try:
+                detail = response.json()["error"]["message"]
+            except (ValueError, KeyError):
+                detail = response.text[:200]
+            logger.error(f"Error sending message chunk {i+1}: {detail}")
             return False
-        
+
         # Small delay between messages to avoid rate limiting
         if i < len(message_chunks) - 1:
             time.sleep(0.2)
@@ -351,7 +373,6 @@ def send_error_message(sender_id, error_message):
     return True
 
 def send_reaction(sender_id, message_id, reaction_type=os.getenv("DEFAULT_REACTION_TYPE", "love")):
-    url = f"https://graph.instagram.com/v22.0/me/messages/?access_token={get_access_token()}"
     payload = {
         "recipient": {"id": sender_id},
         "sender_action": "react", # Or set to unreact to remove the reaction
@@ -360,11 +381,23 @@ def send_reaction(sender_id, message_id, reaction_type=os.getenv("DEFAULT_REACTI
             "reaction": reaction_type # Omit if removing a reaction
         }
     }
-    response = requests.post(url, json=payload)
+    response = requests.post(
+        "https://graph.instagram.com/v22.0/me/messages/",
+        params=_auth_params(),
+        json=payload,
+        timeout=30,
+    )
     if response.status_code != 200:
-        logger.error(f"Error sending reaction: {response.json()['error']['message']}")
+        try:
+            detail = response.json()["error"]["message"]
+        except (ValueError, KeyError):
+            detail = response.text[:200]
+        logger.error(f"Error sending reaction: {detail}")
 
-    return response.json()
+    try:
+        return response.json()
+    except ValueError:
+        return {}
 
 def exchange_for_long_lived_token(short_lived_token, client_id, client_secret):
     """
@@ -394,12 +427,12 @@ def exchange_for_long_lived_token(short_lived_token, client_id, client_secret):
         logger.exception(f"Error exchanging token: {e}")
         return {"error": str(e)}
 
-def refresh_long_lived_token(force=False, min_days=7):
+def refresh_long_lived_token(force=False, min_days=30):
     """Roll the stored long-lived token forward.
 
-    Called by /refresh-token and by the background health loop. Refreshing is
-    only meaningful inside the last 7 days of the 60-day window; forcing it
-    outside that window returns refreshed=False instead of hitting the API.
+    Instagram long-lived tokens live 60 days and can be refreshed any time
+    after they are 24 hours old. We refresh from day 30, which leaves a month
+    of daily attempts before expiry instead of a single last-minute window.
     """
     token_doc = creds.find_one()
     if not token_doc:
@@ -545,7 +578,7 @@ def get_recent_conversations(sender_id, limit=25):
     try:
         response = requests.get(
             "https://graph.instagram.com/v22.0/me/conversations",
-            params={"user_id": sender_id, "access_token": get_access_token()},
+            params={"user_id": sender_id, **_auth_params()},
             timeout=30,
         )
         conversations = response.json().get("data") or []

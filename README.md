@@ -38,10 +38,14 @@ docker run -p 5000:5000 --env-file .env saadsaiyed7/reel-finder:1.3.0
 
 ## Operations notes
 
-- `GET /token-status` reports how many days the Instagram token has left.
-  A background loop refreshes it automatically inside the last 7 days and
-  logs `CRITICAL` once it has expired.
+- Full Meta app configuration and the token strategy: [docs/META_APP_SETUP.md](docs/META_APP_SETUP.md).
+- `GET /token-status` (admin) reports how many days the Instagram token has left.
+  A background loop refreshes it automatically from day 30 of its 60-day life
+  and logs `CRITICAL` once it has expired.
 - `processed_mids.mid` is unique: each webhook `mid` is claimed once, so
   Instagram retries cannot reprocess a reel.
 - Stored reel links expire. Search falls back to the saved description when
   the original media URL no longer resolves.
+- `POST /webhook` rejects requests whose `X-Hub-Signature-256` does not match
+  `INSTA_APP_SECRET`. `/refresh-token`, `/token-status` and `/conversations`
+  require `ADMIN_TOKEN`; `/health` is the only unauthenticated status route.

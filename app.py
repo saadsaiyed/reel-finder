@@ -1,10 +1,11 @@
-VERSION = "1.3.0"
-import requests, os, secrets, logging, threading, time
+VERSION = "1.3.1"
+import requests, os, secrets, logging, threading, time, hmac, hashlib
+from functools import wraps
 from dotenv import load_dotenv
 load_dotenv(override=True)
 from flask import Flask, request, render_template
 from flask_cors import CORS
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pymongo.errors import DuplicateKeyError
 
@@ -18,6 +19,7 @@ from functions import (
     run_gemini,
     refresh_long_lived_token,
     _is_permalink,
+    _auth_params,
     users,
     processed,
     unprocessed_mids,
@@ -115,17 +117,69 @@ def _run_tracked(fn, *args, mid=None, **kwargs):
 
 
 # --------------------------------------------------------------------------
-# Token health: the 60-day token used to expire silently because nothing
-# refreshed it. This loop rolls it forward a week before expiry and shouts
-# when the token is already dead.
+# Security: verify Meta's webhook signature, protect operational routes,
+# and alert on token trouble.
 # --------------------------------------------------------------------------
 
+_sig_warning_shown = False
+
+
+def _verify_signature(raw_body, header):
+    """Validate X-Hub-Signature-256 against INSTA_APP_SECRET.
+
+    Returns True/False when a secret is configured, or None when it is not and
+    verification is therefore impossible.
+    """
+    secret = os.environ.get("INSTA_APP_SECRET")
+    if not secret:
+        return None
+    if not header or not header.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header)
+
+
+def require_admin(view):
+    """Guard operational routes with ADMIN_TOKEN (Bearer or X-Admin-Token)."""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        expected = os.environ.get("ADMIN_TOKEN")
+        if not expected:
+            return {"error": "ADMIN_TOKEN is not configured on the server"}, 503
+        supplied = request.headers.get("X-Admin-Token")
+        auth = request.headers.get("Authorization", "")
+        if not supplied and auth.startswith("Bearer "):
+            supplied = auth[7:]
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            return {"error": "unauthorized"}, 401
+        return view(*args, **kwargs)
+    return wrapper
+
+
+def _notify(text):
+    """Best-effort alert POST to ALERT_WEBHOOK_URL (ntfy-style plain body)."""
+    url = os.environ.get("ALERT_WEBHOOK_URL")
+    if not url:
+        return
+    try:
+        requests.post(url, data=text.encode("utf-8"), timeout=10)
+    except Exception:
+        logger.warning("Alert webhook failed", exc_info=True)
+
+
+
 def _token_health_loop(interval_seconds=6 * 3600):
+    """Refresh the token from day 30 of its 60-day life, and alert on trouble.
+
+    Refreshing at 30 days leaves ~30 daily checks before expiry, so a short
+    outage or a failed refresh cannot silently kill the bot.
+    """
     while True:
         try:
             token_doc = creds.find_one()
             if not token_doc:
                 logger.critical("No Instagram token stored; the bot cannot send DMs")
+                _notify("reel-finder: no Instagram token stored, DMs will fail")
             else:
                 expires_at = token_doc.get("expires_at")
                 if not isinstance(expires_at, datetime):
@@ -137,13 +191,23 @@ def _token_health_loop(interval_seconds=6 * 3600):
                             f"Instagram token EXPIRED {abs(days_left):.1f} days ago. "
                             "Re-authenticate at / to restore the bot."
                         )
-                    elif days_left <= 7:
-                        logger.warning(f"Token expires in {days_left:.1f} days; refreshing")
+                        _notify(
+                            f"reel-finder: Instagram token expired {abs(days_left):.1f} days "
+                            "ago. Re-authenticate at /."
+                        )
+                    elif days_left <= 30:
+                        logger.info(f"Token has {days_left:.1f} days left; refreshing")
                         result = refresh_long_lived_token()
                         if result.get("error"):
                             logger.error(f"Automatic token refresh failed: {result['error']}")
+                            _notify(
+                                f"reel-finder: token refresh failed ({result['error']}). "
+                                f"{days_left:.1f} days left."
+                            )
                         else:
-                            logger.info(f"Token refreshed; valid {result['days_remaining']} more days")
+                            logger.info(
+                                f"Token refreshed; valid {result['days_remaining']} more days"
+                            )
                     else:
                         logger.info(f"Instagram token valid for {days_left:.1f} more days")
         except Exception:
@@ -151,13 +215,58 @@ def _token_health_loop(interval_seconds=6 * 3600):
         time.sleep(interval_seconds)
 
 
+def _seed_token_from_env():
+    """First boot with a dashboard-generated token: verify it, then persist it.
+
+    Makes the DB the source of truth so the refresh loop can take over, instead
+    of the app depending on a token that only lives in an env var.
+    """
+    if creds.find_one():
+        return
+    token = os.environ.get("INSTA_ACCESS_TOKEN")
+    if not token:
+        logger.warning("No stored token and no INSTA_ACCESS_TOKEN: DMs will fail")
+        return
+    try:
+        r = requests.get(
+            "https://graph.instagram.com/v22.0/me",
+            params={**_auth_params(), "fields": "id,username"},
+            timeout=15,
+        )
+        data = r.json()
+        if r.status_code != 200 or data.get("error"):
+            logger.error(f"INSTA_ACCESS_TOKEN is not usable: {data}")
+            return
+        creds.insert_one({
+            "access_token": token,
+            "user_id": data.get("id"),
+            "username": data.get("username"),
+            "expires_in": 60 * 24 * 3600,
+            "created_at": datetime.now(),
+            "expires_at": datetime.now() + timedelta(days=60),
+            "token_type": "long_lived",
+            "source": "env_bootstrap",
+        })
+        logger.info(f"Seeded creds from INSTA_ACCESS_TOKEN for @{data.get('username')}")
+    except Exception:
+        logger.exception("Could not validate INSTA_ACCESS_TOKEN at startup")
+
+
 _ensure_indexes()
+_seed_token_from_env()
 threading.Thread(target=_token_health_loop, name="token-health", daemon=True).start()
+
+
+@app.route("/health")
+def health():
+    """Unauthenticated liveness probe: no secrets, no user data."""
+    return {"ok": True, "version": VERSION}, 200
 
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     """Handle Instagram webhook verification and message processing."""
+    global _sig_warning_shown
     try:
         if request.method == "GET":
             verify_token = str(request.args.get("hub.verify_token"))
@@ -170,6 +279,18 @@ def webhook():
             return "Invalid verify_token", 403
 
         elif request.method == "POST":
+            # Verify Meta's signature over the raw body before trusting it.
+            raw = request.get_data()
+            sig_ok = _verify_signature(raw, request.headers.get("X-Hub-Signature-256"))
+            if sig_ok is False:
+                logger.warning("Rejected webhook: invalid X-Hub-Signature-256")
+                return "Invalid signature", 403
+            if sig_ok is None and not _sig_warning_shown:
+                logger.warning(
+                    "INSTA_APP_SECRET is not set: webhook signatures are NOT verified"
+                )
+                _sig_warning_shown = True
+
             body = request.get_json(silent=True) or {}
             logger.info(f"POST request received with body: {body}")
 
@@ -585,6 +706,7 @@ def callback():
         }, 500
 
 @app.route("/refresh-token", methods=["POST"])
+@require_admin
 def refresh_token():
     """
     Force a token refresh / report remaining validity.
@@ -609,6 +731,7 @@ def refresh_token():
         return {"error": str(e)}, 500
 
 @app.route("/token-status", methods=["GET"])
+@require_admin
 def token_status():
     """
     Get the current status and expiration time of the stored token.
@@ -647,6 +770,7 @@ def token_status():
         return {"error": str(e)}, 500
 
 @app.route("/conversations/<conversation_id>")
+@require_admin
 def messages(conversation_id):
     """Developer utility: import a DM history and backfill the vector store.
 
@@ -658,7 +782,7 @@ def messages(conversation_id):
         url = f"https://graph.instagram.com/v22.0/{conversation_id}/messages"
         params = {
             "fields": "attachments,id,message,from,to,created_time,reactions,shares",
-            "access_token": get_access_token(),
+            **_auth_params(),
         }
         for _ in range(10):  # bounded pagination
             page = requests.get(url, params=params, timeout=30).json()
