@@ -142,7 +142,9 @@ first failed DM rather than after.
 Required:
 
 - `DB_CONNECTION_STRING` — MongoDB connection string.
-- `QDRANT_URL`, `QDRANT_API_KEY` — vector store.
+- `QDRANT_URL`, `QDRANT_API_KEY` — vector store. Local deployment:
+  `QDRANT_URL=http://172.17.0.1:6333` and `QDRANT_API_KEY` empty. The bundled
+  container is bound to the Docker bridge gateway only and needs no auth.
 - `GEMINI_API_KEY` — reel description generation.
 - `INSTA_CLIENT_ID`, `INSTA_CLIENT_SECRET` — from App settings → Basic.
 - `INSTA_REDIRECT_URI` — must match the Business login redirect URI exactly.

@@ -32,9 +32,23 @@ Making it easy for you to find correct reel when you need
 ## Docker
 
 ```bash
-docker build -t saadsaiyed7/reel-finder:1.3.0 .
-docker run -p 5000:5000 --env-file .env saadsaiyed7/reel-finder:1.3.0
+docker build -t saadsaiyed7/reel-finder:1.4.0 .
+docker run -p 5000:5000 --env-file .env saadsaiyed7/reel-finder:1.4.0
 ```
+
+## Vector store
+
+A local Qdrant instance is the deployment default:
+
+```bash
+docker run -d --name qdrant --restart unless-stopped \
+  -p 172.17.0.1:6333:6333 -p 172.17.0.1:6334:6334 \
+  -v qdrant_storage:/qdrant/storage qdrant/qdrant:latest
+```
+
+Then set `QDRANT_URL=http://172.17.0.1:6333` and leave `QDRANT_API_KEY` empty.
+Bound to the Docker bridge gateway, so containers can reach it and the internet
+cannot. Data lives in the `qdrant_storage` volume.
 
 ## Operations notes
 
