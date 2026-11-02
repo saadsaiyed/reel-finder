@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Instagram API with Instagram Login -> graph.instagram.com
 # Instagram API with Facebook Login -> graph.facebook.com (Page access token)
-GRAPH_BASE = os.environ.get("GRAPH_BASE", "https://graph.instagram.com").rstrip("/")
+GRAPH_BASE = (os.environ.get("GRAPH_BASE") or "https://graph.instagram.com").rstrip("/")
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v22.0")
 GRAPH = f"{GRAPH_BASE}/{GRAPH_VERSION}"
 

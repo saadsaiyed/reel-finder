@@ -219,29 +219,45 @@ def _token_health_loop(interval_seconds=6 * 3600):
 
 
 def _seed_token_from_env():
-    """First boot with a dashboard-generated token: verify it, then persist it.
+    """Persist a dashboard-generated token on boot, and recover from expiry.
 
-    Makes the DB the source of truth so the refresh loop can take over, instead
-    of the app depending on a token that only lives in an env var.
+    The DB is the source of truth so the refresh loop can take over. If the
+    stored token has already expired, a fresh INSTA_ACCESS_TOKEN replaces it —
+    otherwise the app would keep using a dead token forever.
     """
-    if creds.find_one():
-        return
     token = os.environ.get("INSTA_ACCESS_TOKEN")
-    if not token:
+    existing = creds.find_one()
+
+    if existing:
+        expires_at = existing.get("expires_at")
+        expired = isinstance(expires_at, datetime) and expires_at <= datetime.now()
+        if not expired:
+            return
+        if not token:
+            logger.critical("Stored Instagram token expired and no INSTA_ACCESS_TOKEN to recover with")
+            return
+        logger.info("Stored Instagram token has expired; replacing it from INSTA_ACCESS_TOKEN")
+    elif not token:
         logger.warning("No stored token and no INSTA_ACCESS_TOKEN: DMs will fail")
         return
+
     try:
         target = os.environ.get("IG_ID") or "me"
-        r = requests.get(
-            f"{GRAPH}/{target}",
-            params={**_auth_params(), "fields": "id,username"},
-            timeout=15,
-        )
+        # Use the env token explicitly: the stored one may be the expired token
+        # we are trying to replace.
+        params = {"access_token": token, "fields": "id,username"}
+        secret = os.environ.get("INSTA_APP_SECRET")
+        if secret:
+            params["appsecret_proof"] = hmac.new(
+                secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256
+            ).hexdigest()
+        r = requests.get(f"{GRAPH}/{target}", params=params, timeout=15)
         data = r.json()
         if r.status_code != 200 or data.get("error"):
             logger.error(f"INSTA_ACCESS_TOKEN is not usable: {data}")
             return
         permanent = token.startswith("EAA")
+        creds.delete_many({})
         creds.insert_one({
             "access_token": token,
             "user_id": data.get("id") or os.environ.get("IG_ID"),
