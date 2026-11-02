@@ -10,6 +10,12 @@ from datetime import datetime, timedelta
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Instagram API with Instagram Login -> graph.instagram.com
+# Instagram API with Facebook Login -> graph.facebook.com (Page access token)
+GRAPH_BASE = os.environ.get("GRAPH_BASE", "https://graph.instagram.com").rstrip("/")
+GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v22.0")
+GRAPH = f"{GRAPH_BASE}/{GRAPH_VERSION}"
+
 # Initialize database connections
 db_connection_string = os.getenv("DB_CONNECTION_STRING")
 if not db_connection_string:
@@ -231,7 +237,7 @@ def get_similar_messages(collection_name, text, limit=1):
 
 def _send_video(sender_id, link):
     response = requests.post(
-        "https://graph.instagram.com/v22.0/me/messages",
+        f"{GRAPH}/me/messages",
         params=_auth_params(),
         json={
             "recipient": {"id": sender_id},
@@ -325,13 +331,23 @@ def split_message(text, max_length=1000):
     logger.debug(f"Split message into {len(chunks)} chunks: {[len(c) for c in chunks]}")
     return chunks
 
+def _messaging_token():
+    """Token used for Send API calls.
+
+    Instagram Login deployments use the stored Instagram user token.
+    Facebook Login deployments use a Page access token derived from a
+    system-user token, supplied as INSTA_MESSAGING_TOKEN.
+    """
+    return os.environ.get("INSTA_MESSAGING_TOKEN") or get_access_token() or ""
+
+
 def _auth_params():
     """Graph API query params: the token plus appsecret_proof when configured.
 
     appsecret_proof is an HMAC of the access token keyed by the app secret, so
     a leaked token is useless without the secret as well.
     """
-    token = get_access_token() or ""
+    token = _messaging_token()
     params = {"access_token": token}
     secret = os.environ.get("INSTA_APP_SECRET")
     if secret and token:
@@ -353,7 +369,7 @@ def send_error_message(sender_id, error_message):
         }
         logger.info(f"Sending message chunk {i+1}/{len(message_chunks)} ({len(chunk)} chars)")
         response = requests.post(
-            "https://graph.instagram.com/v22.0/me/messages",
+            f"{GRAPH}/me/messages",
             params=_auth_params(),
             json=payload,
             timeout=30,
@@ -382,7 +398,7 @@ def send_reaction(sender_id, message_id, reaction_type=os.getenv("DEFAULT_REACTI
         }
     }
     response = requests.post(
-        "https://graph.instagram.com/v22.0/me/messages/",
+        f"{GRAPH}/me/messages/",
         params=_auth_params(),
         json=payload,
         timeout=30,
@@ -437,6 +453,11 @@ def refresh_long_lived_token(force=False, min_days=30):
     token_doc = creds.find_one()
     if not token_doc:
         return {"error": "No token stored in database"}
+
+    # Facebook system-user / Page tokens do not expire and cannot be refreshed
+    # through ig_refresh_token; refreshing them is a no-op, not a failure.
+    if os.environ.get("INSTA_MESSAGING_TOKEN") or os.environ.get("INSTA_ACCESS_TOKEN", "").startswith("EAA"):
+        return {"ok": True, "refreshed": False, "permanent": True}
 
     expires_at = token_doc.get("expires_at")
     if not force and isinstance(expires_at, datetime):
@@ -577,7 +598,7 @@ def get_recent_conversations(sender_id, limit=25):
     """Returns the last `limit` non-empty messages as 'User: ...' / 'Bot: ...' lines."""
     try:
         response = requests.get(
-            "https://graph.instagram.com/v22.0/me/conversations",
+            f"{GRAPH}/me/conversations",
             params={"user_id": sender_id, **_auth_params()},
             timeout=30,
         )
@@ -587,10 +608,10 @@ def get_recent_conversations(sender_id, limit=25):
         conversation_id = conversations[0].get("id")
 
         response = requests.get(
-            f"https://graph.instagram.com/v22.0/{conversation_id}/messages",
+            f"{GRAPH}/{conversation_id}/messages",
             params={
                 "fields": "id,message,from,created_time",
-                "access_token": get_access_token(),
+                **_auth_params(),
             },
             timeout=30,
         )

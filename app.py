@@ -1,4 +1,4 @@
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -20,6 +20,7 @@ from functions import (
     refresh_long_lived_token,
     _is_permalink,
     _auth_params,
+    GRAPH,
     users,
     processed,
     unprocessed_mids,
@@ -182,7 +183,9 @@ def _token_health_loop(interval_seconds=6 * 3600):
                 _notify("reel-finder: no Instagram token stored, DMs will fail")
             else:
                 expires_at = token_doc.get("expires_at")
-                if not isinstance(expires_at, datetime):
+                if token_doc.get("token_type") == "system_user":
+                    logger.info("Instagram system-user token never expires; nothing to refresh")
+                elif not isinstance(expires_at, datetime):
                     logger.warning("Stored token has no expires_at; cannot schedule refresh")
                 else:
                     days_left = (expires_at - datetime.now()).total_seconds() / 86400
@@ -228,8 +231,9 @@ def _seed_token_from_env():
         logger.warning("No stored token and no INSTA_ACCESS_TOKEN: DMs will fail")
         return
     try:
+        target = os.environ.get("IG_ID") or "me"
         r = requests.get(
-            "https://graph.instagram.com/v22.0/me",
+            f"{GRAPH}/{target}",
             params={**_auth_params(), "fields": "id,username"},
             timeout=15,
         )
@@ -237,17 +241,21 @@ def _seed_token_from_env():
         if r.status_code != 200 or data.get("error"):
             logger.error(f"INSTA_ACCESS_TOKEN is not usable: {data}")
             return
+        permanent = token.startswith("EAA")
         creds.insert_one({
             "access_token": token,
-            "user_id": data.get("id"),
+            "user_id": data.get("id") or os.environ.get("IG_ID"),
             "username": data.get("username"),
-            "expires_in": 60 * 24 * 3600,
+            "expires_in": None if permanent else 60 * 24 * 3600,
             "created_at": datetime.now(),
-            "expires_at": datetime.now() + timedelta(days=60),
-            "token_type": "long_lived",
+            "expires_at": None if permanent else datetime.now() + timedelta(days=60),
+            "token_type": "system_user" if permanent else "long_lived",
             "source": "env_bootstrap",
         })
-        logger.info(f"Seeded creds from INSTA_ACCESS_TOKEN for @{data.get('username')}")
+        logger.info(
+            f"Seeded creds from INSTA_ACCESS_TOKEN for @{data.get('username')} "
+            f"({'non-expiring' if permanent else '60 days'})"
+        )
     except Exception:
         logger.exception("Could not validate INSTA_ACCESS_TOKEN at startup")
 
@@ -779,7 +787,7 @@ def messages(conversation_id):
     """
     try:
         messages = []
-        url = f"https://graph.instagram.com/v22.0/{conversation_id}/messages"
+        url = f"{GRAPH}/{conversation_id}/messages"
         params = {
             "fields": "attachments,id,message,from,to,created_time,reactions,shares",
             **_auth_params(),

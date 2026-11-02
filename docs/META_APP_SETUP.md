@@ -65,7 +65,40 @@ plain HTTP or self-signed callback.
 - Keep the app in Development unless you actually need other users. Fewer moving
   parts, no review queue, same behaviour for your own account.
 
-## 5. How the token stops being a problem
+## 5. Facebook Login for Business / system-user token
+
+If the app was created as **Instagram API with Facebook Login** (Facebook Login
+for Business configuration, system-user access token), three things differ:
+
+- **Base URL:** `graph.facebook.com`, not `graph.instagram.com`. Set
+  `GRAPH_BASE=https://graph.facebook.com`.
+- **Messaging token:** a **Page access token**, not the system-user token. The
+  Instagram professional account must be linked to a Facebook Page, and the
+  system user must have both the Page and the Instagram account assigned in
+  Business Manager.
+- **Webhooks:** the app must be Live for Meta to deliver events, and Business
+  Verification is required for this API variant.
+
+System-user tokens never expire, which is the appeal — but the token that
+actually sends DMs is the Page token derived from it:
+
+```bash
+# 1. find the Page linked to the Instagram account
+curl -s "https://graph.facebook.com/v22.0/me/accounts?access_token=<SUAT>"
+
+# 2. exchange it for the Page access token
+curl -s "https://graph.facebook.com/v22.0/<PAGE_ID>?fields=access_token&access_token=<SUAT>"
+```
+
+Set the result as `INSTA_MESSAGING_TOKEN`, the Page id as `INSTA_PAGE_ID`, and
+the system-user token as `INSTA_ACCESS_TOKEN` (used only for bootstrap). A Page
+token derived from a system user does not expire, so the refresh loop detects it
+and stops trying to refresh — there is nothing to refresh.
+
+`/callback` and `LOGIN_URL` are unused in this mode: there is no per-user OAuth
+handshake, the system user already has the asset.
+
+## 6. How the token stops being a problem
 
 Facts that drive the design:
 
@@ -95,7 +128,7 @@ Net effect: as long as the container runs at least once every ~30 days, the
 token never expires. If it does run dry, the alert arrives weeks before the
 first failed DM rather than after.
 
-## 6. Environment variables
+## 7. Environment variables
 
 Required:
 
@@ -106,7 +139,15 @@ Required:
 - `INSTA_REDIRECT_URI` — must match the Business login redirect URI exactly.
 - `IG_ID` — the bot account's Instagram user id; used to ignore its own messages.
 - `WEBHOOK_VERIFY_TOKEN` — random string, also entered in the webhook config.
-- `LOGIN_URL` — the authorize URL above.
+- `LOGIN_URL` — the authorize URL above (Instagram Login only).
+
+Facebook Login deployments add:
+
+- `GRAPH_BASE=https://graph.facebook.com` (default is `graph.instagram.com`).
+- `INSTA_MESSAGING_TOKEN` — the Page access token used to send DMs.
+- `INSTA_PAGE_ID` — the Facebook Page linked to the Instagram account.
+
+Optional: `GRAPH_VERSION` (default `v22.0`).
 
 Security:
 
@@ -122,7 +163,7 @@ Security:
 
 Optional: `GEMINI_PROMPT`, `DEFAULT_REACTION_TYPE`, `FLASK_SECRET_KEY`.
 
-## 7. Operational checklist
+## 8. Operational checklist
 
 - [ ] `INSTA_APP_SECRET` and `ADMIN_TOKEN` set in the deployment.
 - [ ] `GET /health` returns `{"ok": true, "version": "1.3.1"}`.
