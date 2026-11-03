@@ -130,8 +130,16 @@ def handle_text_with_gemini_agent(user_id, text, mid, created_time, replied_to_m
         if replied_to_mid:
             found_point = find_point_by_mid(user_id, replied_to_mid)
             if not found_point:
+                # The user replied to one of the bot's own messages: that mid
+                # belongs to the reply, not to the reel. If a recently forwarded
+                # reel is still pending, attach the text to it instead of failing.
+                pending = unprocessed_mids.find_one({"sender_id": user_id})
+                if pending:
+                    logger.info("Reply target unknown; attaching context to the last forwarded reel")
+                    return save_context_to_last_reel(user_id, text, mid, created_time)
+
                 logger.warning(f"No points found for replied-to MID: {replied_to_mid}")
-                send_error_message(user_id, "Replied to message not found. Cannot process your request.")
+                send_error_message(user_id, "I don't have a recent reel to attach that to. Forward the reel again.")
                 return False
             found_payload = found_point.payload
             logger.info(f"Found point with payload: {found_payload}")

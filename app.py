@@ -1,4 +1,4 @@
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -509,27 +509,26 @@ def handle_attachment(context):
         source = "caption"
         link_kind = context.get("link_kind") or "none"
         result = ""
+        resolution_error = None
 
         if can_download and url:
             result = run_gemini(url, context.get("attachment_type") in ("ig_reel", "reel"))
 
         elif link_kind == "permalink" and url:
             # Instagram serves permalinks as HTML; yt-dlp resolves the real media.
-            path, err = resolve_permalink(url)
+            path, resolution_error = resolve_permalink(url)
             if path:
                 try:
                     result = describe_media_file(path)
                 except Exception as exc:
                     logger.exception(f"Gemini failed on resolved media for mid {mid}")
                     _notify(f"reel-finder: Gemini failed on {url[:80]}: {str(exc)[:120]}")
-            elif err == "rate_limited":
+            elif resolution_error == "rate_limited":
                 logger.warning(f"Instagram rate-limited or blocked yt-dlp for {url}")
                 _notify("reel-finder: Instagram blocked/rate-limited a download "
                         f"({url[:100]}) — falling back to caption")
-                send_error_message(
-                    sender_id,
-                    "Instagram is limiting me right now, so I saved the caption instead of watching it.",
-                )
+            elif resolution_error == "restricted":
+                logger.info(f"Post is audience-restricted for mid {mid}: {url}")
             else:
                 logger.warning(f"Could not resolve permalink for mid {mid}: {url}")
                 _notify(f"reel-finder: could not resolve permalink {url[:100]}")
@@ -580,9 +579,21 @@ def handle_attachment(context):
         if source == "gemini":
             send_error_message(sender_id, description)
         else:
+            if resolution_error == "restricted":
+                reason = ("Instagram marks this post as restricted, so it won't show the video "
+                          "to me without a logged-in session.")
+            elif resolution_error == "rate_limited":
+                reason = "Instagram is rate-limiting me right now, so I couldn't open the video."
+            elif link_kind == "permalink":
+                reason = "I couldn't download this one, so I only have its caption."
+            else:
+                reason = "I couldn't watch this one, so I only have its caption."
+
             send_error_message(
                 sender_id,
-                f"I couldn't watch this one, so I saved its caption:\n\n{description}",
+                f"{reason}\n\nSaved caption:\n{description}\n\n"
+                f"Reply to this message with what it was about and I'll attach your "
+                f"description to it.",
             )
         return True
     except Exception as exc:

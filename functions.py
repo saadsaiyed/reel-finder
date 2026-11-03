@@ -155,6 +155,14 @@ def _is_block_error(message):
     ))
 
 
+def _is_restricted_error(message):
+    low = (message or "").lower()
+    return any(k in low for k in (
+        "isn't available to everyone", "is not available to everyone",
+        "restricted", "age-restricted", "sensitive content",
+    ))
+
+
 def resolve_permalink(url):
     """Download the media behind an Instagram permalink with yt-dlp.
 
@@ -191,8 +199,14 @@ def resolve_permalink(url):
                     f"({os.path.getsize(path)} bytes)")
         return path, None
     except Exception as exc:
-        kind = "rate_limited" if _is_block_error(str(exc)) else "failed"
-        logger.warning(f"yt-dlp failed ({kind}) for {url}: {str(exc)[:200]}")
+        message = str(exc)
+        if _is_restricted_error(message):
+            kind = "restricted"
+        elif _is_block_error(message):
+            kind = "rate_limited"
+        else:
+            kind = "failed"
+        logger.warning(f"yt-dlp failed ({kind}) for {url}: {message[:200]}")
         return None, kind
 
 
