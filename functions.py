@@ -304,19 +304,30 @@ def send_similar_reel(sender_id, text):
         payload = results[0].payload or {}
         description = payload.get("message") or ""
         link = payload.get("permalink") or payload.get("link") or ""
+        link_kind = payload.get("link_kind") or ("permalink" if _is_permalink(link) else "cdn")
 
-        # Stored links are usually signed Instagram CDN URLs that expire. Try the
-        # link, but never leave the user with a dead attachment: fall back to text.
+        # A permalink opens the reel inside Instagram; it is not a media URL, so
+        # it belongs in a text message. Only CDN links can be sent as attachments.
+        if link and link_kind == "permalink":
+            body = f"Closest match: {description}\n\n{link}" if description else f"Closest match:\n{link}"
+            send_error_message(sender_id, body.strip())
+            return {"message": "Link sent"}
+
         if link and _send_video(sender_id, link):
             return {"message": "Reel sent"}
 
         if description:
-            send_error_message(
-                sender_id,
-                f"Closest match: {description}\n\n"
-                f"(I couldn't resend the original reel — Instagram's media link has expired.)",
-            )
+            body = f"Closest match: {description}"
+            if link:
+                body += f"\n\n{link}"
+            else:
+                body += "\n\n(This one's media link has expired, so here is the description.)"
+            send_error_message(sender_id, body)
             return {"message": "Description fallback sent"}
+
+        if link:
+            send_error_message(sender_id, f"Closest match:\n{link}")
+            return {"message": "Link only"}
 
         send_error_message(sender_id, "Found a match but couldn't resend it. Try another search.")
         return {"error": "No resendable match"}
