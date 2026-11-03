@@ -210,6 +210,43 @@ def resolve_permalink(url):
         return None, kind
 
 
+def resolve_media_url(url):
+    """Return a fresh direct media URL for a permalink, without downloading.
+
+    Instagram's CDN URLs are signed and short-lived, so this has to run at send
+    time. Returns (url, error_kind).
+    """
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "format": "3/b[ext=mp4]/b",
+        "socket_timeout": 20,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        direct = info.get("url")
+        if not direct:
+            for fmt in reversed(info.get("formats") or []):
+                if fmt.get("url"):
+                    direct = fmt["url"]
+                    break
+        if not direct:
+            return None, "failed"
+        return direct, None
+    except Exception as exc:
+        message = str(exc)
+        if _is_restricted_error(message):
+            kind = "restricted"
+        elif _is_block_error(message):
+            kind = "rate_limited"
+        else:
+            kind = "failed"
+        logger.warning(f"yt-dlp URL resolve failed ({kind}) for {url}: {message[:160]}")
+        return None, kind
+
+
 def _point_id(mid, text):
     """Deterministic id: re-ingesting the same mid+text overwrites instead of
     duplicating, and two reels can no longer collide (uuid4 % 10^12 could)."""
@@ -320,9 +357,15 @@ def send_similar_reel(sender_id, text):
         link = payload.get("permalink") or payload.get("link") or ""
         link_kind = payload.get("link_kind") or ("permalink" if _is_permalink(link) else "cdn")
 
-        # A permalink opens the reel inside Instagram; it is not a media URL, so
-        # it belongs in a text message. Only CDN links can be sent as attachments.
+        # A permalink opens the reel inside Instagram; it is not a media URL. Get
+        # a fresh signed CDN URL and send the video inline so the user does not
+        # have to open a browser.
         if link and link_kind == "permalink":
+            media_url, resolve_error = resolve_media_url(link)
+            if media_url and _send_video(sender_id, media_url):
+                return {"message": "Reel sent inline"}
+            if resolve_error in ("rate_limited", "restricted"):
+                logger.info(f"Inline send unavailable ({resolve_error}); sending link for {link}")
             body = f"Closest match: {description}\n\n{link}" if description else f"Closest match:\n{link}"
             send_error_message(sender_id, body.strip())
             return {"message": "Link sent"}

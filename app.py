@@ -1,4 +1,4 @@
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
