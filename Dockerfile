@@ -1,5 +1,6 @@
 # Use an official Python runtime as a parent image
-FROM python:3.9-slim
+# 3.12: current yt-dlp requires >=3.11, and 3.9 is EOL.
+FROM python:3.12-slim
 
 # Set the working directory in the container
 WORKDIR /app

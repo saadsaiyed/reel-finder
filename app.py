@@ -1,4 +1,4 @@
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -18,6 +18,8 @@ from functions import (
     get_access_token,
     run_gemini,
     refresh_long_lived_token,
+    resolve_permalink,
+    describe_media_file,
     _is_permalink,
     _auth_params,
     GRAPH,
@@ -340,6 +342,7 @@ def webhook():
 
     except Exception as exc:
         logger.exception("Webhook error: %s", exc)
+        _notify(f"reel-finder: webhook error: {str(exc)[:150]}")
         return "Internal error", 500
 
 
@@ -504,15 +507,42 @@ def handle_attachment(context):
     try:
         description = ""
         source = "caption"
+        link_kind = context.get("link_kind") or "none"
+        result = ""
 
         if can_download and url:
             result = run_gemini(url, context.get("attachment_type") in ("ig_reel", "reel"))
-            if result and result not in ("Gemini API quota exceeded", "Error running Gemini"):
-                description = result.strip()
-                source = "gemini"
-            elif result:
-                logger.warning(f"Gemini failed for {context.get('attachment_type')} "
-                               f"mid {mid}: {result}")
+
+        elif link_kind == "permalink" and url:
+            # Instagram serves permalinks as HTML; yt-dlp resolves the real media.
+            path, err = resolve_permalink(url)
+            if path:
+                try:
+                    result = describe_media_file(path)
+                except Exception as exc:
+                    logger.exception(f"Gemini failed on resolved media for mid {mid}")
+                    _notify(f"reel-finder: Gemini failed on {url[:80]}: {str(exc)[:120]}")
+            elif err == "rate_limited":
+                logger.warning(f"Instagram rate-limited or blocked yt-dlp for {url}")
+                _notify("reel-finder: Instagram blocked/rate-limited a download "
+                        f"({url[:100]}) — falling back to caption")
+                send_error_message(
+                    sender_id,
+                    "Instagram is limiting me right now, so I saved the caption instead of watching it.",
+                )
+            else:
+                logger.warning(f"Could not resolve permalink for mid {mid}: {url}")
+                _notify(f"reel-finder: could not resolve permalink {url[:100]}")
+
+        if result and result not in ("Gemini API quota exceeded", "Error running Gemini"):
+            description = result.strip()
+            source = "gemini"
+        elif result == "Gemini API quota exceeded":
+            logger.warning(f"Gemini quota exceeded for mid {mid}")
+            _notify("reel-finder: Gemini quota exceeded while describing a reel")
+        elif result:
+            logger.warning(f"Gemini failed for {context.get('attachment_type')} "
+                           f"mid {mid}: {result}")
 
         # Permalinks cannot be downloaded (Instagram serves HTML), so the
         # caption is the searchable text we keep instead of failing.

@@ -1,6 +1,7 @@
 import os, logging, time, asyncio, hashlib, hmac, tempfile, requests
 from google import genai
 import uuid
+import yt_dlp
 from langchain_huggingface import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
@@ -72,13 +73,49 @@ def detect_file_type(response):
     logger.warning(f"Could not determine file type from Content-Type: {content_type}, magic bytes: {content.hex()[:20]}... - defaulting to mp4")
     return 'video', 'mp4'
 
+DEFAULT_PROMPT = ("With simple texts only and no `here you go...` or `following is:...` types "
+                  "of statements, for each scene in this video, generate captions that describe "
+                  "the scene along with any spoken text placed in quotation marks without "
+                  "timestamp. Provide your explanation. Only respond with what is asked. "
+                  "\nExample: A guy tasting something spicy and can't control his emotions and tears up.")
+
+
+def describe_media_file(filename):
+    """Upload one local media file to Gemini and return its description.
+
+    Raises on failure so callers can distinguish quota from a bad file. The
+    temp file is always removed.
+    """
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    try:
+        media = client.files.upload(file=filename)
+        logger.debug(f"Completed upload: {media.uri}")
+
+        while media.state.name == "PROCESSING":
+            time.sleep(2)
+            media = client.files.get(name=media.name)
+
+        if media.state.name == "FAILED":
+            raise ValueError("Gemini could not process the file")
+
+        prompt = os.environ.get("GEMINI_PROMPT", DEFAULT_PROMPT)
+        response = client.models.generate_content(
+            model=GEMINI_VISION_MODEL, contents=[media, prompt]
+        )
+        return response.text or ""
+    finally:
+        try:
+            os.remove(filename)
+        except OSError:
+            pass
+
+
 async def gemini(url, is_reel=True):
-    if url == "":
+    """Download a CDN media URL and describe it. Returns "" if it is not media."""
+    if not url:
         return ""
 
     logger.debug(f"Downloading file from: {url}")
-
-    # Download the file
     response = requests.get(url)
     if response.status_code != 200:
         logger.error(f"Failed to download file: {response.status_code}")
@@ -91,7 +128,7 @@ async def gemini(url, is_reel=True):
             or head.startswith(b"<!doctype") or head.startswith(b"<html"):
         logger.warning(f"URL returned a web page, not media: {url}")
         return ""
-    
+
     # Detect file type
     file_type, extension = detect_file_type(response)
     # Unique temp file per download: the thread pool processes reels concurrently
@@ -102,77 +139,62 @@ async def gemini(url, is_reel=True):
     handle.close()
 
     logger.info(f"Detected {file_type} file ({extension}): {filename}")
-    
-    # Save the file
+
+    with open(filename, 'wb') as f:
+        f.write(response.content)
+    logger.debug(f"File downloaded and saved: {filename} ({len(response.content)} bytes)")
+
+    return describe_media_file(filename)
+
+
+def _is_block_error(message):
+    low = (message or "").lower()
+    return any(k in low for k in (
+        "429", "too many requests", "rate limit", "login required",
+        "checkpoint", "blocked", "403 forbidden", "not available",
+    ))
+
+
+def resolve_permalink(url):
+    """Download the media behind an Instagram permalink with yt-dlp.
+
+    Returns (path, error_kind): error_kind is None on success, "rate_limited"
+    when Instagram refused the request, "failed" otherwise. Instagram serves
+    permalinks as HTML, so this is the only way to actually watch a shared reel.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="ytdl_", dir="/tmp")
+    opts = {
+        "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+        "format": "3/b[ext=mp4]/b",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "retries": 1,
+        "socket_timeout": 20,
+        "max_filesize": 150 * 1024 * 1024,
+    }
     try:
-        with open(filename, 'wb') as f:
-            f.write(response.content)
-        logger.debug(f"File downloaded and saved: {filename} ({len(response.content)} bytes)")
-    except Exception as e:
-        logger.error(f"Failed to save file: {e}")
-        return ""
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            path = ydl.prepare_filename(info)
 
-    # Create a new event loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+        if not os.path.exists(path):
+            candidates = [os.path.join(tmpdir, f) for f in os.listdir(tmpdir)
+                          if not f.endswith((".part", ".ytdl"))]
+            path = candidates[0] if candidates else ""
 
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        if not path or not os.path.exists(path):
+            logger.error(f"yt-dlp produced no file for {url}")
+            return None, "failed"
 
-    logger.debug("Uploading file to Gemini...")
-    try:
-        video_file = client.files.upload(file=filename)
-        logger.debug(f"Completed upload: {video_file.uri}")
-    except Exception as e:
-        logger.error(f"Failed to upload file: {e}")
-        try:
-            os.remove(filename)
-        except:
-            pass
-        return ""
+        logger.info(f"yt-dlp resolved {url} -> {os.path.basename(path)} "
+                    f"({os.path.getsize(path)} bytes)")
+        return path, None
+    except Exception as exc:
+        kind = "rate_limited" if _is_block_error(str(exc)) else "failed"
+        logger.warning(f"yt-dlp failed ({kind}) for {url}: {str(exc)[:200]}")
+        return None, kind
 
-    # Wait until the file is processed
-    while video_file.state.name == "PROCESSING":
-        print('.', end='', flush=True)
-        await asyncio.sleep(1)
-        video_file = client.files.get(name=video_file.name)
-
-    if video_file.state.name == "FAILED":
-        logger.error(f"File processing failed: {video_file.state.name}")
-        try:
-            os.remove(filename)
-        except:
-            pass
-        raise ValueError(video_file.state.name)
-
-    logger.debug('File processed successfully')
-
-    # Generate content from the file
-    prompt = os.environ.get("GEMINI_PROMPT", "With simple texts only and no `here you go...` or `following is:...` types of statements, for each scene in this video, generate captions that describe the scene along with any spoken text placed in quotation marks without timestamp. Provide your explanation. Only respond with what is asked. \nExample: A guy tasting something spicy and can't control his emotions and tears up.")
-    
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_VISION_MODEL,
-            contents=[
-                video_file,
-                prompt
-            ]
-        )
-    except Exception as e:
-        logger.error(f"Failed to generate content: {e}")
-        try:
-            os.remove(filename)
-        except:
-            pass
-        return ""
-
-    # Clean up temp file
-    try:
-        os.remove(filename)
-        logger.debug(f"Temp file deleted: {filename}")
-    except Exception as e:
-        logger.warning(f"Failed to delete temp file: {e}")
-
-    return response.text
 
 def _point_id(mid, text):
     """Deterministic id: re-ingesting the same mid+text overwrites instead of

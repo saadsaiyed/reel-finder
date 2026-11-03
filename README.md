@@ -53,6 +53,10 @@ cannot. Data lives in the `qdrant_storage` volume.
 ## Operations notes
 
 - Full Meta app configuration and the token strategy: [docs/META_APP_SETUP.md](docs/META_APP_SETUP.md).
+- Shared reels and posts arrive as **permalinks**, which serve HTML, so they are
+  downloaded with **yt-dlp** before Gemini sees them. If yt-dlp is blocked or
+  rate-limited the caption is indexed instead, and `ALERT_WEBHOOK_URL` gets a
+  notification.
 - `GET /token-status` (admin) reports how many days the Instagram token has left.
   A background loop refreshes it automatically from day 30 of its 60-day life
   and logs `CRITICAL` once it has expired.

@@ -156,5 +156,10 @@ def handle_text_with_gemini_agent(user_id, text, mid, created_time, replied_to_m
         return False
     except Exception as e:
         logger.exception(f"Error in handle_text_with_gemini_agent: {e}")
+        try:
+            from app import _notify
+            _notify(f"reel-finder: AI handler error: {str(e)[:150]}")
+        except Exception:
+            pass
         send_error_message(user_id, "Error processing your message with AI")
         return False
