@@ -13,6 +13,9 @@ from functions import (
 from prompt import (AGENT_PROMPT, ANSWER_QUESTION)
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
+# Model names deprecate per project; keep them configurable.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,7 +103,7 @@ def answer_question(user_id, question, context):
         prompt = prompt.replace("{CHAT_HISTORY}", get_recent_conversations(user_id))
         prompt = prompt.replace("{question}", question)
         logging.info(f"Answer Question Prompt: {prompt}")
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         logging.info(f"Gemini response: {response.text}")
         send_error_message(user_id, response.text)
         return True
@@ -135,7 +138,7 @@ def handle_text_with_gemini_agent(user_id, text, mid, created_time, replied_to_m
 
         # Check if the message is a question or context to save
         response = client.models.generate_content(
-            model="gemini-2.5-flash", contents=AGENT_PROMPT.replace("{text}", text)
+            model=GEMINI_MODEL, contents=AGENT_PROMPT.replace("{text}", text)
         )
         verdict = (response.text or "").strip().lower()
         logging.info(f"Gemini intent verdict: {verdict}")

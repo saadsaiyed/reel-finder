@@ -16,6 +16,9 @@ GRAPH_BASE = (os.environ.get("GRAPH_BASE") or "https://graph.instagram.com").rst
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v22.0")
 GRAPH = f"{GRAPH_BASE}/{GRAPH_VERSION}"
 
+# Model names deprecate per project; keep them configurable.
+GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL") or "gemini-3.5-flash"
+
 # Initialize database connections
 db_connection_string = os.getenv("DB_CONNECTION_STRING")
 if not db_connection_string:
@@ -140,7 +143,7 @@ async def gemini(url, is_reel=True):
     
     try:
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model=GEMINI_VISION_MODEL,
             contents=[
                 video_file,
                 prompt
