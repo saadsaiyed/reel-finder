@@ -83,6 +83,14 @@ async def gemini(url, is_reel=True):
     if response.status_code != 200:
         logger.error(f"Failed to download file: {response.status_code}")
         return ""
+
+    # A permalink returns Instagram's web page, not media. Never upload HTML
+    # to Gemini: it burns a request and always fails processing.
+    head = response.content[:512].lstrip().lower()
+    if response.headers.get("content-type", "").lower().startswith("text/html") \
+            or head.startswith(b"<!doctype") or head.startswith(b"<html"):
+        logger.warning(f"URL returned a web page, not media: {url}")
+        return ""
     
     # Detect file type
     file_type, extension = detect_file_type(response)

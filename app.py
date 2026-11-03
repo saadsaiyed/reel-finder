@@ -1,4 +1,4 @@
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -368,6 +368,58 @@ def _handle_messaging(messaging, created_time):
         logger.exception(f"Failed to dispatch mid {mid}")
 
 
+_LINK_ATTACHMENTS = {"ig_reel", "reel", "ig_post", "share", "story", "ig_story", "story_mention"}
+_MEDIA_ATTACHMENTS = {"image", "video", "audio", "file", "media"}
+_CDN_HOSTS = ("fbsbx.com", "fbcdn.net", "cdninstagram.com", "scontent")
+
+
+def _link_kind(url):
+    """permalink: permanent instagram.com page. cdn: downloadable media URL."""
+    if not url:
+        return "none"
+    low = url.lower()
+    if "instagram.com/" in low and any(p in low for p in ("/reel/", "/p/", "/stories/", "/tv/")):
+        return "permalink"
+    if any(h in low for h in _CDN_HOSTS):
+        return "cdn"
+    return "other"
+
+
+def _attachment_context(sender_id, mid, attachment, created_time):
+    """Normalise any Instagram attachment into an ingestion context.
+
+    Meta sends shares (ig_reel, ig_post, legacy share, stories) as permalinks
+    and direct media as CDN URLs; both need to land in the same shape.
+    """
+    att_type = (attachment or {}).get("type")
+    payload = (attachment or {}).get("payload") or {}
+
+    if att_type not in _LINK_ATTACHMENTS and att_type not in _MEDIA_ATTACHMENTS \
+            and att_type != "ephemeral":
+        return None
+
+    url = (payload.get("url") or "").strip()
+    kind = _link_kind(url)
+    caption = (payload.get("title") or payload.get("caption") or "").strip()
+
+    return {
+        "sender_id": sender_id,
+        "mid": mid,
+        "attachment_type": att_type,
+        "reel_id": payload.get("reel_video_id"),
+        "post_id": payload.get("ig_post_media_id"),
+        "media_id": payload.get("reel_video_id") or payload.get("ig_post_media_id") or payload.get("id"),
+        "caption": caption,
+        "url": url,
+        "link": url,
+        "link_kind": kind,
+        # A permalink serves HTML, not media; only CDN/direct-media URLs can
+        # actually be downloaded and watched.
+        "can_download": bool(url) and (kind == "cdn" or att_type in _MEDIA_ATTACHMENTS),
+        "created_time": created_time,
+    }
+
+
 def _dispatch(sender_id, message, mid, created_time):
     text = message.get("text")
     if text:
@@ -381,36 +433,35 @@ def _dispatch(sender_id, message, mid, created_time):
         return
 
     for attachment in message.get("attachments") or []:
-        if attachment.get("type") not in ("ig_reel", "ig_post"):
+        context = _attachment_context(sender_id, mid, attachment, created_time)
+        if context is None:
+            logger.info(f"Ignoring unsupported attachment type: {attachment.get('type')}")
             continue
 
-        payload = attachment.get("payload") or {}
-        url = payload.get("url", "")
-        context = {
-            "sender_id": sender_id,
-            "mid": mid,
-            "reel_id": payload.get("reel_video_id"),
-            "post_id": payload.get("ig_post_media_id"),
-            "created_time": created_time,
-            "url": url,
-        }
+        if context["attachment_type"] == "ephemeral":
+            send_error_message(sender_id, "That media disappears after viewing, so I can't save it.")
+            _finish(mid, True)
+            return
+
         executor.submit(_run_tracked, handle_attachment, context, mid=mid)
         send_reaction(sender_id, mid, "love")
 
         unprocessed_mids.delete_many({"sender_id": sender_id})
         unprocessed_mids.insert_one({
             "sender_id": sender_id,
-            "message": payload.get("title", ""),
+            "message": context["caption"],
             "mid": mid,
-            "reel_id": payload.get("reel_video_id"),
-            "link": url,
-            "link_kind": "permalink" if _is_permalink(url) else "cdn",
+            "reel_id": context["reel_id"],
+            "media_id": context["media_id"],
+            "attachment_type": context["attachment_type"],
+            "link": context["url"],
+            "link_kind": context["link_kind"],
             "created_time": created_time,
         })
         return
 
     send_error_message(
-        sender_id, "Unsupported attachment type. Please send an Instagram reel."
+        sender_id, "Unsupported attachment type. Please send an Instagram reel or post."
     )
     _finish(mid, True)
 
@@ -434,12 +485,12 @@ def handle_search(sender_id, search_query, mid):
 
 
 def handle_attachment(context):
-    """Background worker: describe the reel with Gemini, store it, reply."""
+    """Describe a share, or fall back to its caption when the media is unreachable."""
     sender_id = context.get("sender_id")
     mid = context.get("mid")
-    url = context.get("url")
-    reel_id = context.get("reel_id")
-    post_id = context.get("post_id")
+    url = context.get("url") or ""
+    caption = (context.get("caption") or "").strip()
+    can_download = bool(context.get("can_download"))
     created_time = context.get("created_time")
 
     def fail(message):
@@ -451,26 +502,41 @@ def handle_attachment(context):
         return False
 
     try:
-        title = run_gemini(url, True if reel_id else False)
+        description = ""
+        source = "caption"
 
-        if title == "Gemini API quota exceeded":
-            logger.error("Gemini API quota exceeded for URL: %s", url)
-            return fail("Gemini API quota exceeded, try again later")
-        if title == "Error running Gemini":
-            logger.error("Error running Gemini for URL: %s", url)
-            return fail("Error processing your reel, try again later")
-        if not title:
-            logger.error("Gemini returned an empty description for URL: %s", url)
-            return fail("Could not describe that reel, try again later")
+        if can_download and url:
+            result = run_gemini(url, context.get("attachment_type") in ("ig_reel", "reel"))
+            if result and result not in ("Gemini API quota exceeded", "Error running Gemini"):
+                description = result.strip()
+                source = "gemini"
+            elif result:
+                logger.warning(f"Gemini failed for {context.get('attachment_type')} "
+                               f"mid {mid}: {result}")
+
+        # Permalinks cannot be downloaded (Instagram serves HTML), so the
+        # caption is the searchable text we keep instead of failing.
+        if not description and caption:
+            description = caption
+
+        if not description:
+            logger.warning(
+                f"No description available for mid {mid}: type={context.get('attachment_type')} "
+                f"can_download={can_download} url={url[:60]}"
+            )
+            return fail("I couldn't read that one. Try forwarding it again, or reply with what it was about.")
 
         payload = {
             "sender_id": sender_id,
-            "message": title,
+            "message": description,
             "mid": mid,
-            "reel_id": reel_id if reel_id else post_id,
+            "reel_id": context.get("reel_id") or context.get("post_id") or context.get("media_id"),
+            "media_id": context.get("media_id"),
+            "attachment_type": context.get("attachment_type"),
+            "caption": caption,
             "link": url,
-            # CDN links are signed and expire; permalinks do not.
-            "link_kind": "permalink" if _is_permalink(url) else "cdn",
+            "link_kind": context.get("link_kind") or _link_kind(url),
+            "description_source": source,
             "created_time": created_time,
         }
 
@@ -481,8 +547,13 @@ def handle_attachment(context):
             )
             return fail("Error storing data, try again later")
 
-        # notify user and react
-        send_error_message(sender_id, title)
+        if source == "gemini":
+            send_error_message(sender_id, description)
+        else:
+            send_error_message(
+                sender_id,
+                f"I couldn't watch this one, so I saved its caption:\n\n{description}",
+            )
         return True
     except Exception as exc:
         logger.exception("Exception in handle_attachment: %s", exc)
