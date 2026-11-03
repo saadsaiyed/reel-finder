@@ -319,14 +319,20 @@ def get_similar_messages(collection_name, text, limit=1):
         return {"error": f"Error retrieving similar messages: {exc}"}
 
 
-def _send_video(sender_id, link):
+def _send_video(sender_id, link, reply_to_mid=None):
+    body = {
+        "recipient": {"id": sender_id},
+        "message": {"attachment": {"type": "video", "payload": {"url": link}}},
+    }
+    if reply_to_mid:
+        # Instagram expects reply_to at the top level; inside `message` it is
+        # rejected with "Invalid keys".
+        body["reply_to"] = {"mid": reply_to_mid}
+
     response = requests.post(
         f"{GRAPH}/me/messages",
         params=_auth_params(),
-        json={
-            "recipient": {"id": sender_id},
-            "message": {"attachment": {"type": "video", "payload": {"url": link}}},
-        },
+        json=body,
         timeout=30,
     )
     ok = response.status_code == 200
@@ -356,21 +362,23 @@ def send_similar_reel(sender_id, text):
         description = payload.get("message") or ""
         link = payload.get("permalink") or payload.get("link") or ""
         link_kind = payload.get("link_kind") or ("permalink" if _is_permalink(link) else "cdn")
+        # Replying to the user's original forward keeps the video in context.
+        original_mid = payload.get("mid")
 
         # A permalink opens the reel inside Instagram; it is not a media URL. Get
         # a fresh signed CDN URL and send the video inline so the user does not
         # have to open a browser.
         if link and link_kind == "permalink":
             media_url, resolve_error = resolve_media_url(link)
-            if media_url and _send_video(sender_id, media_url):
+            if media_url and _send_video(sender_id, media_url, reply_to_mid=original_mid):
                 return {"message": "Reel sent inline"}
             if resolve_error in ("rate_limited", "restricted"):
                 logger.info(f"Inline send unavailable ({resolve_error}); sending link for {link}")
             body = f"Closest match: {description}\n\n{link}" if description else f"Closest match:\n{link}"
-            send_error_message(sender_id, body.strip())
+            send_error_message(sender_id, body.strip(), reply_to_mid=original_mid)
             return {"message": "Link sent"}
 
-        if link and _send_video(sender_id, link):
+        if link and _send_video(sender_id, link, reply_to_mid=original_mid):
             return {"message": "Reel sent"}
 
         if description:
@@ -379,11 +387,11 @@ def send_similar_reel(sender_id, text):
                 body += f"\n\n{link}"
             else:
                 body += "\n\n(This one's media link has expired, so here is the description.)"
-            send_error_message(sender_id, body)
+            send_error_message(sender_id, body, reply_to_mid=original_mid)
             return {"message": "Description fallback sent"}
 
         if link:
-            send_error_message(sender_id, f"Closest match:\n{link}")
+            send_error_message(sender_id, f"Closest match:\n{link}", reply_to_mid=original_mid)
             return {"message": "Link only"}
 
         send_error_message(sender_id, "Found a match but couldn't resend it. Try another search.")
@@ -458,7 +466,7 @@ def _auth_params():
     return params
 
 
-def send_error_message(sender_id, error_message):
+def send_error_message(sender_id, error_message, reply_to_mid=None):
     """Send error message(s) to user, splitting into multiple messages if needed."""
     # Split message if it exceeds 1000 characters
     message_chunks = split_message(error_message, max_length=1000)
@@ -468,6 +476,8 @@ def send_error_message(sender_id, error_message):
             "recipient": {"id": sender_id},
             "message": {"text": chunk},
         }
+        if reply_to_mid and i == 0:
+            payload["reply_to"] = {"mid": reply_to_mid}
         logger.info(f"Sending message chunk {i+1}/{len(message_chunks)} ({len(chunk)} chars)")
         response = requests.post(
             f"{GRAPH}/me/messages",
