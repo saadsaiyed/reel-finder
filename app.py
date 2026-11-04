@@ -1,4 +1,4 @@
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -28,6 +28,8 @@ from functions import (
     credit_balance,
     debit_credit,
     out_of_credits_message,
+    daily_summary,
+    stats,
     MAX_MESSAGE_CHARS,
     _is_permalink,
     _auth_params,
@@ -1094,6 +1096,37 @@ def messages(conversation_id):
     except Exception as exc:
         logger.exception(f"Error importing conversation: {exc}")
         return {"error": str(exc)}, 500
+
+def _daily_digest_loop():
+    """Send the usage digest once a day at or after DIGEST_HOUR (default 9)."""
+    hour = int(os.environ.get("DIGEST_HOUR") or 9)
+    while True:
+        try:
+            admin = os.environ.get("ADMIN_IGSID")
+            if admin and datetime.now().hour >= hour:
+                day = datetime.now().strftime("%Y-%m-%d")
+                marker = f"daily_summary:{day}"
+                try:
+                    stats.insert_one({"_id": marker, "claimed_at": datetime.now()})
+                except DuplicateKeyError:
+                    pass
+                else:
+                    try:
+                        text = daily_summary(day)
+                        send_error_message(admin, text)
+                        _notify(text.replace("\n", " | "))
+                        logger.info(f"Daily digest sent for {day}")
+                    except Exception:
+                        stats.delete_one({"_id": marker})
+                        raise
+        except Exception:
+            logger.warning("Daily digest failed", exc_info=True)
+        time.sleep(900)
+
+
+if os.environ.get("ADMIN_IGSID"):
+    threading.Thread(target=_daily_digest_loop, daemon=True).start()
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv("PORT", 8080)), debug=True)

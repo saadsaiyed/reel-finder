@@ -215,6 +215,111 @@ def out_of_credits_message(sender_id):
             f"Get more reels: {buy_link(sender_id)}")
 
 
+# --------------------------------------------------------------------------
+# Admin control from the DM, and the daily digest.
+# --------------------------------------------------------------------------
+
+def admin_igsid():
+    return os.environ.get("ADMIN_IGSID") or ""
+
+
+def is_admin(sender_id):
+    return bool(admin_igsid()) and str(sender_id) == str(admin_igsid())
+
+
+def daily_summary(day=None):
+    """Usage digest for one day (local date). Deterministic, no model call."""
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    start = datetime.strptime(day, "%Y-%m-%d")
+    end = start + timedelta(days=1)
+    window = {"created_at": {"$gte": start, "$lt": end}}
+
+    reels = credit_ledger.count_documents({**window, "delta": -1})
+    senders = len(credit_ledger.distinct("sender_id", {**window, "delta": -1}))
+    new_accounts = accounts.count_documents({"created_at": {"$gte": start, "$lt": end}})
+    calls = (stats.find_one({"_id": f"gemini_calls:{day}"}) or {}).get("count", 0)
+    total_accounts = accounts.count_documents({})
+    total_credits = sum(
+        int((d or {}).get("credits", 0))
+        for d in accounts.find({}, {"credits": 1})
+    )
+    label = datetime.strptime(day, "%Y-%m-%d").strftime("%a %d %b")
+    return (f"Reelmark — {label}\n"
+            f"Reels saved: {reels}\n"
+            f"Active senders: {senders}\n"
+            f"New accounts: {new_accounts}\n"
+            f"Credits spent: {reels}\n"
+            f"Gemini calls: {calls}\n"
+            f"Accounts total: {total_accounts} ({total_credits} credits held)")
+
+
+def admin_help():
+    return ("Admin commands:\n"
+            "#summary - today's usage\n"
+            "#say <igsid> <text> - send a DM as the bot\n"
+            "#grant <igsid> <n> - add credits\n"
+            "#who <igsid> - account details\n"
+            "#recent - last 5 active senders")
+
+
+def admin_command(sender_id, text):
+    """Handle an operator command. Returns the reply, or None if not a command."""
+    if not is_admin(sender_id):
+        return None
+    text = (text or "").strip()
+    if not text.startswith("#"):
+        return None
+
+    parts = text.split(maxsplit=3)
+    cmd = parts[0].lower()
+    args = parts[1:]
+
+    if cmd in ("#help", "#?"):
+        return admin_help()
+
+    if cmd == "#summary":
+        return daily_summary()
+
+    if cmd == "#recent":
+        rows = list(credit_ledger.find({"delta": -1}, {"sender_id": 1, "created_at": 1})
+                    .sort("_id", -1).limit(5))
+        if not rows:
+            return "No reels saved yet."
+        return "Recent senders:\n" + "\n".join(
+            f"{r['sender_id']} — {r.get('created_at', '')}" for r in rows
+        )
+
+    if cmd == "#say" and len(args) >= 2:
+        target = args[0]
+        message = text.split(args[0], 1)[1].strip()
+        if not message:
+            return "Usage: #say <igsid> <text>"
+        ok = send_error_message(target, message)
+        record_message(sender_id, "bot", f"[admin -> {target}] {message}")
+        return "Sent." if ok else "Send failed, check the logs."
+
+    if cmd == "#grant" and len(args) >= 2:
+        try:
+            units = int(args[1])
+        except ValueError:
+            return "Usage: #grant <igsid> <n>"
+        balance = grant_credits(args[0], units, "admin_grant",
+                                ref=f"admin:{sender_id}:{int(time.time())}")
+        return f"Granted {units}. Balance is now {balance}."
+
+    if cmd == "#who" and args:
+        doc = accounts.find_one({"sender_id": args[0]}) or {}
+        if not doc:
+            return f"No account for {args[0]}."
+        return (f"{doc.get('sender_id')}\n"
+                f"plan: {doc.get('plan')}\n"
+                f"credits: {doc.get('credits')}\n"
+                f"seen: {doc.get('last_seen')}\n"
+                f"reels today: {doc.get('reels_day_used')}")
+
+    return "Unknown command. Try #help."
+
+
 def record_message(sender_id, role, text, mid=None):
     """Append to the per-sender transcript, keeping the newest 20 turns."""
     text = (text or "").strip()

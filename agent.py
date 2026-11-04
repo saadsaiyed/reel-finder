@@ -11,6 +11,7 @@ from functions import (
     gemini_generate,
     budget_available,
     account_message,
+    admin_command,
     unprocessed_mids,
     processed,
 )
@@ -145,6 +146,12 @@ def handle_text_with_gemini_agent(user_id, text, mid, created_time, replied_to_m
     """Routes an incoming text message. Returns True when handled successfully."""
     try:
         from app import handle_search
+
+        # Operator commands run before search and before any model call.
+        admin_reply = admin_command(user_id, text)
+        if admin_reply is not None:
+            send_error_message(user_id, admin_reply, reply_to_mid=mid)
+            return True
 
         lowered = text.lower()
         if lowered.startswith("search"):
