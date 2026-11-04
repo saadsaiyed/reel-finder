@@ -187,7 +187,7 @@ def handle_text_with_gemini_agent(user_id, text, mid, created_time, replied_to_m
             pending = unprocessed_mids.find_one({"sender_id": user_id})
             target_mid = (pending or {}).get("mid")
             if target_mid:
-                deadline = time.time() + 40
+                deadline = time.time() + 120
                 while time.time() < deadline:
                     point = find_point_by_mid(user_id, target_mid)
                     if point:
@@ -195,6 +195,16 @@ def handle_text_with_gemini_agent(user_id, text, mid, created_time, replied_to_m
                         logger.info("Text waited for in-flight reel %s", target_mid)
                         break
                     time.sleep(1)
+
+                # Still describing: say one clean line instead of letting the
+                # model guess at what the user might have meant.
+                if not found_payload:
+                    send_error_message(
+                        user_id,
+                        "I'm still reading that reel. Ask me again in a minute.",
+                        reply_to_mid=mid,
+                    )
+                    return True
 
         # Check if the message is a question or context to save
         intent, answer = _route_text(
