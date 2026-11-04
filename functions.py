@@ -40,6 +40,71 @@ accounts = db_client["master"]["accounts"]
 
 TRANSCRIPT_TURNS = 20
 
+# Abuse limits. Every one is env-tunable so you can change them in CasaOS
+# without a rebuild.
+TEXT_PER_HOUR = int(os.environ.get("LIMIT_TEXT_PER_HOUR") or 30)
+REELS_PER_DAY = int(os.environ.get("LIMIT_REELS_PER_DAY") or 40)
+GEMINI_DAILY_CALL_CAP = int(os.environ.get("GEMINI_DAILY_CALL_CAP") or 800)
+MAX_MESSAGE_CHARS = int(os.environ.get("MAX_MESSAGE_CHARS") or 1500)
+
+stats = db_client["master"]["stats"]
+
+
+def _today():
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def budget_available():
+    doc = stats.find_one({"_id": f"gemini_calls:{_today()}"}) or {}
+    return int(doc.get("count", 0)) < GEMINI_DAILY_CALL_CAP
+
+
+def gemini_generate(contents, model=None):
+    """Single funnel for Gemini calls so the global daily budget is enforced."""
+    if not budget_available():
+        logger.error("Gemini daily call budget exhausted; refusing the call")
+        return None
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    response = client.models.generate_content(
+        model=model or GEMINI_VISION_MODEL, contents=contents
+    )
+    stats.update_one({"_id": f"gemini_calls:{_today()}"}, {"$inc": {"count": 1}}, upsert=True)
+    return response
+
+
+def check_user_limit(sender_id, kind):
+    """Per-sender quota. kind is 'text' (hourly) or 'reel' (daily).
+
+    Returns (allowed, message_for_the_user).
+    """
+    now = datetime.now()
+    doc = accounts.find_one({"sender_id": sender_id}) or {}
+
+    if kind == "reel":
+        day = now.strftime("%Y-%m-%d")
+        used = int(doc.get("reels_day_used", 0)) if doc.get("reels_day") == day else 0
+        if used >= REELS_PER_DAY:
+            return False, (f"You've reached today's limit of {REELS_PER_DAY} reels. "
+                           "Send the rest tomorrow.")
+        if doc.get("reels_day") == day:
+            accounts.update_one({"sender_id": sender_id}, {"$inc": {"reels_day_used": 1}})
+        else:
+            accounts.update_one({"sender_id": sender_id},
+                                {"$set": {"reels_day": day, "reels_day_used": 1}}, upsert=True)
+        return True, ""
+
+    hour = now.strftime("%Y-%m-%dT%H")
+    used = int(doc.get("text_hour_used", 0)) if doc.get("text_hour") == hour else 0
+    if used >= TEXT_PER_HOUR:
+        return False, (f"That's {TEXT_PER_HOUR} messages in an hour, which is my limit. "
+                       "Give me a few minutes.")
+    if doc.get("text_hour") == hour:
+        accounts.update_one({"sender_id": sender_id}, {"$inc": {"text_hour_used": 1}})
+    else:
+        accounts.update_one({"sender_id": sender_id},
+                            {"$set": {"text_hour": hour, "text_hour_used": 1}}, upsert=True)
+    return True, ""
+
 
 def ensure_account(sender_id):
     """One record per Instagram sender; the future paywall hangs off this."""
@@ -110,14 +175,12 @@ def classify_note(text, description=""):
     if not text:
         return "statement"
     try:
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        model = os.environ.get("GEMINI_MODEL") or GEMINI_VISION_MODEL
         prompt = ("Classify the user's message about an Instagram reel they just sent. "
                   "Reply with exactly one word: question or statement.\n\n"
                   f"Reel description: {(description or '')[:1500]}\n\n"
                   f"User message: {text}")
-        response = client.models.generate_content(model=model, contents=prompt)
-        verdict = (response.text or "").strip().lower()
+        response = gemini_generate(prompt, model=os.environ.get("GEMINI_MODEL"))
+        verdict = ((response.text if response else "") or "").strip().lower()
         if "question" in verdict:
             return "question"
         if "statement" in verdict:
@@ -196,12 +259,9 @@ def one_sentence_summary(text):
     if not text:
         return ""
     try:
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        model = os.environ.get("GEMINI_MODEL") or GEMINI_VISION_MODEL
-        response = client.models.generate_content(
-            model=model, contents=SUMMARY_PROMPT + text[:4000]
-        )
-        sentence = _first_sentence(response.text or "")
+        response = gemini_generate(SUMMARY_PROMPT + text[:4000],
+                                   model=os.environ.get("GEMINI_MODEL"))
+        sentence = _first_sentence((response.text if response else "") or "")
         if sentence:
             return sentence
     except Exception as exc:
@@ -215,6 +275,8 @@ def describe_media_file(filename):
     Raises on failure so callers can distinguish quota from a bad file. The
     temp file is always removed.
     """
+    if not budget_available():
+        raise RuntimeError("daily gemini budget exhausted")
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     try:
         media = client.files.upload(file=filename)
@@ -228,9 +290,9 @@ def describe_media_file(filename):
             raise ValueError("Gemini could not process the file")
 
         prompt = os.environ.get("GEMINI_PROMPT", DEFAULT_PROMPT)
-        response = client.models.generate_content(
-            model=GEMINI_VISION_MODEL, contents=[media, prompt]
-        )
+        response = gemini_generate([media, prompt], model=GEMINI_VISION_MODEL)
+        if response is None:
+            raise RuntimeError("daily gemini budget exhausted")
         return response.text or ""
     finally:
         try:

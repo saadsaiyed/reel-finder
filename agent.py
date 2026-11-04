@@ -1,4 +1,4 @@
-import os, logging
+import os, logging, re
 from google import genai
 from functions import (
     store_embeddings,
@@ -8,16 +8,38 @@ from functions import (
     find_point_by_mid,
     get_recent_conversations,
     recent_transcript,
+    gemini_generate,
+    budget_available,
     unprocessed_mids,
     processed,
 )
-from prompt import (AGENT_PROMPT, ANSWER_QUESTION)
+from prompt import (ROUTER_PROMPT, ANSWER_QUESTION)
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # Model names deprecate per project; keep them configurable.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
 
 logger = logging.getLogger(__name__)
+
+
+def _route_text(text, reel_context, history):
+    """One call decides intent *and* writes the reply, so chit-chat costs one call."""
+    prompt = (ROUTER_PROMPT
+              .replace("{REEL}", (reel_context or "none")[:1500])
+              .replace("{HISTORY}", (history or "none")[:3000])
+              .replace("{text}", text))
+    response = gemini_generate(prompt, model=GEMINI_MODEL)
+    body = ((response.text if response else "") or "").strip()
+    if not body:
+        return None, ""
+    intent_match = re.search(r"INTENT:\s*(context|question|chat)", body, re.I)
+    answer_match = re.search(r"ANSWER:\s*(.*)", body, re.S | re.I)
+    intent = intent_match.group(1).lower() if intent_match else None
+    answer = answer_match.group(1).strip() if answer_match else ""
+    # Guard against the model echoing the label block instead of a reply.
+    if answer.upper().startswith("INTENT:"):
+        answer = ""
+    return intent, answer
 
 
 def save_context_to_replied_reel(user_id, found_payload, text, mid, created_time):
@@ -105,7 +127,10 @@ def answer_question(user_id, question, context, reply_to_mid=None):
         prompt = prompt.replace("{CHAT_HISTORY}", history)
         prompt = prompt.replace("{question}", question)
         logging.info(f"Answer Question Prompt: {prompt[:400]}")
-        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        response = gemini_generate(prompt, model=GEMINI_MODEL)
+        if response is None:
+            send_error_message(user_id, "I'm at capacity right now. Try again shortly.")
+            return False
         logging.info(f"Gemini response: {(response.text or '')[:200]}")
         send_error_message(user_id, response.text, reply_to_mid=reply_to_mid)
         return True
@@ -147,22 +172,32 @@ def handle_text_with_gemini_agent(user_id, text, mid, created_time, replied_to_m
             logger.info(f"Found point with payload: {found_payload}")
 
         # Check if the message is a question or context to save
-        response = client.models.generate_content(
-            model=GEMINI_MODEL, contents=AGENT_PROMPT.replace("{text}", text)
+        intent, answer = _route_text(
+            text,
+            found_payload.get("message") if found_payload else None,
+            recent_transcript(user_id),
         )
-        verdict = (response.text or "").strip().lower()
-        logging.info(f"Gemini intent verdict: {verdict}")
+        logging.info(f"Router intent: {intent}")
 
-        if "question" in verdict:
-            return answer_question(
-                user_id, text, found_payload.get("message") if found_payload else None
-            )
-        if "context" in verdict:
+        if intent == "context":
             if found_payload:
                 return save_context_to_replied_reel(user_id, found_payload, text, mid, created_time)
             return save_context_to_last_reel(user_id, text, mid, created_time)
 
-        send_error_message(user_id, "Could not determine if your message is a question or context to save.")
+        if intent in ("question", "chat"):
+            reply = answer or (
+                "I'm not sure what to say to that. Send me a reel, ask me a question, "
+                "or use `search <what you remember>`."
+            )
+            send_error_message(user_id, reply, reply_to_mid=mid)
+            return True
+
+        send_error_message(
+            user_id,
+            "I'm at capacity right now. Try again in a few minutes."
+            if not budget_available()
+            else "I didn't catch that. Send a reel, ask me something, or use `search <what you remember>`.",
+        )
         return False
     except Exception as e:
         logger.exception(f"Error in handle_text_with_gemini_agent: {e}")

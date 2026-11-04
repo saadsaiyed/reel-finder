@@ -1,4 +1,4 @@
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -24,6 +24,8 @@ from functions import (
     classify_note,
     ensure_account,
     record_message,
+    check_user_limit,
+    MAX_MESSAGE_CHARS,
     _is_permalink,
     _auth_params,
     GRAPH,
@@ -432,6 +434,13 @@ def _dispatch(sender_id, message, mid, created_time):
     attachments = message.get("attachments") or []
 
     if attachments:
+        allowed, limit_message = check_user_limit(sender_id, "reel")
+        if not allowed:
+            logger.info(f"Reel limit reached for {sender_id}")
+            send_error_message(sender_id, limit_message)
+            _finish(mid, True)
+            return
+
         context = None
         for attachment in attachments:
             context = _attachment_context(sender_id, mid, attachment, created_time)
@@ -470,6 +479,14 @@ def _dispatch(sender_id, message, mid, created_time):
             return
 
     if text:
+        if len(text) > MAX_MESSAGE_CHARS:
+            text = text[:MAX_MESSAGE_CHARS]
+        allowed, limit_message = check_user_limit(sender_id, "text")
+        if not allowed:
+            logger.info(f"Text limit reached for {sender_id}")
+            send_error_message(sender_id, limit_message)
+            _finish(mid, True)
+            return
         replied_to_mid = (message.get("reply_to") or {}).get("mid")
         ensure_account(sender_id)
         record_message(sender_id, "user", text, mid)
