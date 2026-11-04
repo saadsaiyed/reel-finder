@@ -24,6 +24,25 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
 
 logger = logging.getLogger(__name__)
 
+REFUSAL = "I can't share that. I can help you save reels and find them again."
+
+# Defence in depth: even if the model slips, nothing about the stack leaves the DM.
+_BANNED = re.compile(
+    r"\b(hermes|gemini|openai|anthropic|claude|gpt|llm|qdrant|mongo(db)?|flask|docker|"
+    r"github|prompt|api key|system message)\b", re.I)
+_URL = re.compile(r"(https?://|www\.)\S+", re.I)
+
+
+def _safe_reply(text):
+    """Strip anything that describes the implementation, including links."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if _URL.search(text) or _BANNED.search(text):
+        logger.warning("Blocked a reply that leaked implementation details")
+        return REFUSAL
+    return text
+
 
 def _route_text(text, reel_context, history):
     """One call decides intent *and* writes the reply, so chit-chat costs one call."""
@@ -135,7 +154,8 @@ def answer_question(user_id, question, context, reply_to_mid=None):
             send_error_message(user_id, "I'm at capacity right now. Try again shortly.")
             return False
         logging.info(f"Gemini response: {(response.text or '')[:200]}")
-        send_error_message(user_id, response.text, reply_to_mid=reply_to_mid)
+        send_error_message(user_id, _safe_reply(response.text) or REFUSAL,
+                           reply_to_mid=reply_to_mid)
         return True
     except Exception as e:
         logger.exception(f"Error in answer_question: {e}")
@@ -225,7 +245,7 @@ def handle_text_with_gemini_agent(user_id, text, mid, created_time, replied_to_m
             return True
 
         if intent in ("question", "chat"):
-            reply = answer or (
+            reply = _safe_reply(answer) or (
                 "I'm not sure what to say to that. Send me a reel, ask me a question, "
                 "or use `search <what you remember>`."
             )
