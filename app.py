@@ -1,4 +1,4 @@
-VERSION = "1.11.2"
+VERSION = "1.12.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -28,6 +28,7 @@ from functions import (
     check_user_limit,
     credit_balance,
     debit_credit,
+    grant_credits,
     out_of_credits_message,
     start_typing,
     mark_reel_seen,
@@ -296,6 +297,33 @@ def _seed_token_from_env():
 _ensure_indexes()
 _seed_token_from_env()
 threading.Thread(target=_token_health_loop, name="token-health", daemon=True).start()
+
+
+@app.route("/internal/credit", methods=["POST"])
+def internal_credit():
+    """Grant credits from the site after a Stripe payment. Service token only."""
+    expected = os.environ.get("SERVICE_TOKEN")
+    provided = request.headers.get("X-Service-Token") or ""
+    if not expected or not hmac.compare_digest(provided, expected):
+        return {"error": "unauthorized"}, 401
+
+    data = request.get_json(silent=True) or {}
+    igsid = str(data.get("igsid") or "").strip()
+    ref = str(data.get("ref") or "").strip()
+    reason = str(data.get("reason") or "purchase")
+    try:
+        units = int(data.get("units") or 0)
+    except (TypeError, ValueError):
+        return {"error": "units must be an integer"}, 400
+
+    if not igsid or not ref or units == 0:
+        return {"error": "igsid, ref and units are required"}, 400
+    if units > 500:
+        return {"error": "refusing an implausible grant"}, 400
+
+    balance = grant_credits(igsid, units, reason, ref=ref)
+    logger.info(f"Granted {units} credits to {igsid} via {reason} ({ref})")
+    return {"ok": True, "igsid": igsid, "balance": balance}, 200
 
 
 @app.route("/health")
