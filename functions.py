@@ -1,4 +1,4 @@
-import os, logging, time, asyncio, hashlib, hmac, tempfile, requests
+import os, logging, time, asyncio, hashlib, hmac, re, tempfile, requests
 from google import genai
 import uuid
 import yt_dlp
@@ -78,6 +78,40 @@ DEFAULT_PROMPT = ("With simple texts only and no `here you go...` or `following 
                   "the scene along with any spoken text placed in quotation marks without "
                   "timestamp. Provide your explanation. Only respond with what is asked. "
                   "\nExample: A guy tasting something spicy and can't control his emotions and tears up.")
+
+SUMMARY_PROMPT = ("Rewrite this video description as ONE short sentence of at most 25 words. "
+                  "No timestamps, no scene numbers, no preamble, no quotes around the sentence.\n\n")
+
+
+def _first_sentence(text):
+    """Strip leading timestamps and return the first sentence, capped."""
+    cleaned = re.sub(r"^\s*\d{1,2}:\d{2}(?:\s*[-\u2013]\s*\d{1,2}:\d{2})?\s*:?\s*", "", (text or "").strip())
+    cleaned = " ".join(cleaned.split())
+    match = re.match(r"(.+?[.!?])(\s|$)", cleaned)
+    sentence = (match.group(1) if match else cleaned).strip()
+    return sentence[:240]
+
+
+def one_sentence_summary(text):
+    """Collapse a scene-by-scene description into one sentence for the DM reply.
+
+    The full description stays in the vector index; only the reply is shortened.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        model = os.environ.get("GEMINI_MODEL") or GEMINI_VISION_MODEL
+        response = client.models.generate_content(
+            model=model, contents=SUMMARY_PROMPT + text[:4000]
+        )
+        sentence = _first_sentence(response.text or "")
+        if sentence:
+            return sentence
+    except Exception as exc:
+        logger.warning(f"Summary failed; using first sentence instead: {exc}")
+    return _first_sentence(text)
 
 
 def describe_media_file(filename):

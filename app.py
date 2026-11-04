@@ -1,4 +1,4 @@
-VERSION = "1.5.4"
+VERSION = "1.6.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -20,6 +20,7 @@ from functions import (
     refresh_long_lived_token,
     resolve_permalink,
     describe_media_file,
+    one_sentence_summary,
     _is_permalink,
     _auth_params,
     GRAPH,
@@ -577,7 +578,13 @@ def handle_attachment(context):
             return fail("Error storing data, try again later")
 
         if source == "gemini":
-            send_error_message(sender_id, description)
+            # The index keeps the full scene description; the DM gets one line.
+            try:
+                reply = one_sentence_summary(description)
+            except Exception:
+                logger.warning("Summary failed; sending the first sentence")
+                reply = description.split(".")[0][:240]
+            send_error_message(sender_id, reply or description[:240])
         else:
             if resolution_error == "restricted":
                 reason = ("Instagram marks this post as restricted, so it won't show the video "
