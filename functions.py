@@ -30,6 +30,101 @@ creds = db_client["master"]["creds"]
 users = db_client["master"]["users"]
 processed = db_client["master"]["processed_mids"]
 unprocessed_mids = db_client["master"]["unprocessed_mids"]
+messages_col = db_client["master"]["messages"]
+accounts = db_client["master"]["accounts"]
+
+
+# --------------------------------------------------------------------------
+# Conversation transcript and account seam.
+# --------------------------------------------------------------------------
+
+TRANSCRIPT_TURNS = 20
+
+
+def ensure_account(sender_id):
+    """One record per Instagram sender; the future paywall hangs off this."""
+    try:
+        accounts.update_one(
+            {"sender_id": sender_id},
+            {
+                "$setOnInsert": {"plan": "free", "status": "active",
+                                 "created_at": datetime.now()},
+                "$set": {"last_seen": datetime.now()},
+            },
+            upsert=True,
+        )
+    except Exception:
+        logger.warning("Could not upsert account record", exc_info=True)
+
+
+def record_message(sender_id, role, text, mid=None):
+    """Append to the per-sender transcript, keeping the newest 20 turns."""
+    text = (text or "").strip()
+    if not text:
+        return
+    try:
+        messages_col.insert_one({
+            "sender_id": sender_id,
+            "role": role,
+            "text": text[:4000],
+            "mid": mid,
+            "created_at": datetime.now(),
+        })
+        stale = [d["_id"] for d in
+                 messages_col.find({"sender_id": sender_id}, {"_id": 1})
+                 .sort("_id", -1).skip(TRANSCRIPT_TURNS)]
+        if stale:
+            messages_col.delete_many({"_id": {"$in": stale}})
+    except Exception:
+        logger.warning("Could not record transcript line", exc_info=True)
+
+
+def recent_transcript(sender_id, limit=TRANSCRIPT_TURNS):
+    """Last N turns as 'User: ...' / 'Bot: ...' lines, oldest first."""
+    try:
+        rows = list(messages_col.find({"sender_id": sender_id}, {"_id": 0})
+                    .sort("_id", -1).limit(limit))
+    except Exception:
+        logger.warning("Could not read transcript", exc_info=True)
+        return ""
+    lines = [f"{'User' if r.get('role') == 'user' else 'Bot'}: {r.get('text', '')}"
+             for r in reversed(rows)]
+    return "\n".join(lines)
+
+
+def _note_is_question(text):
+    """Cheap fallback when the model call is unavailable."""
+    low = (text or "").strip().lower()
+    if not low:
+        return False
+    if low.endswith("?"):
+        return True
+    return low.split()[0] in {"who", "what", "when", "where", "why", "how",
+                              "is", "are", "was", "were", "do", "does", "did",
+                              "can", "could", "should", "would", "will"}
+
+
+def classify_note(text, description=""):
+    """Is the message with a reel a statement (save it) or a question (answer it)?"""
+    text = (text or "").strip()
+    if not text:
+        return "statement"
+    try:
+        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        model = os.environ.get("GEMINI_MODEL") or GEMINI_VISION_MODEL
+        prompt = ("Classify the user's message about an Instagram reel they just sent. "
+                  "Reply with exactly one word: question or statement.\n\n"
+                  f"Reel description: {(description or '')[:1500]}\n\n"
+                  f"User message: {text}")
+        response = client.models.generate_content(model=model, contents=prompt)
+        verdict = (response.text or "").strip().lower()
+        if "question" in verdict:
+            return "question"
+        if "statement" in verdict:
+            return "statement"
+    except Exception as exc:
+        logger.warning(f"Note classification failed; using heuristic: {exc}")
+    return "question" if _note_is_question(text) else "statement"
 
 # Initialize Qdrant client
 qdrant_client = QdrantClient(url=os.environ.get("QDRANT_URL"), api_key=os.environ.get("QDRANT_API_KEY"))
@@ -526,6 +621,8 @@ def send_error_message(sender_id, error_message, reply_to_mid=None):
                 detail = response.text[:200]
             logger.error(f"Error sending message chunk {i+1}: {detail}")
             return False
+
+        record_message(sender_id, "bot", chunk)
 
         # Small delay between messages to avoid rate limiting
         if i < len(message_chunks) - 1:

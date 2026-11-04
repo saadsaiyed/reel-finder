@@ -1,4 +1,4 @@
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -21,6 +21,9 @@ from functions import (
     resolve_permalink,
     describe_media_file,
     one_sentence_summary,
+    classify_note,
+    ensure_account,
+    record_message,
     _is_permalink,
     _auth_params,
     GRAPH,
@@ -29,7 +32,7 @@ from functions import (
     unprocessed_mids,
     creds,
 )
-from agent import handle_text_with_gemini_agent
+from agent import handle_text_with_gemini_agent, answer_question
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -425,43 +428,57 @@ def _attachment_context(sender_id, mid, attachment, created_time):
 
 
 def _dispatch(sender_id, message, mid, created_time):
-    text = message.get("text")
+    text = (message.get("text") or "").strip()
+    attachments = message.get("attachments") or []
+
+    if attachments:
+        context = None
+        for attachment in attachments:
+            context = _attachment_context(sender_id, mid, attachment, created_time)
+            if context is not None:
+                break
+
+        if context is None:
+            logger.info(f"Ignoring unsupported attachment types for mid {mid}")
+        elif context["attachment_type"] == "ephemeral":
+            send_error_message(sender_id, "That media disappears after viewing, so I can't save it.")
+            _finish(mid, True)
+            return
+        else:
+            # A reel forwarded together with a message: carry the text through
+            # so it can be saved as context or answered as a question.
+            context["user_note"] = text
+            ensure_account(sender_id)
+            if text:
+                record_message(sender_id, "user", text, mid)
+            executor.submit(_run_tracked, handle_attachment, context, mid=mid)
+            send_reaction(sender_id, mid, "love")
+
+            unprocessed_mids.delete_many({"sender_id": sender_id})
+            unprocessed_mids.insert_one({
+                "sender_id": sender_id,
+                "message": context["caption"],
+                "user_note": text,
+                "mid": mid,
+                "reel_id": context["reel_id"],
+                "media_id": context["media_id"],
+                "attachment_type": context["attachment_type"],
+                "link": context["url"],
+                "link_kind": context["link_kind"],
+                "created_time": created_time,
+            })
+            return
+
     if text:
         replied_to_mid = (message.get("reply_to") or {}).get("mid")
+        ensure_account(sender_id)
+        record_message(sender_id, "user", text, mid)
         executor.submit(
             _run_tracked,
             handle_text_with_gemini_agent,
             sender_id, text, mid, created_time, replied_to_mid,
             mid=mid,
         )
-        return
-
-    for attachment in message.get("attachments") or []:
-        context = _attachment_context(sender_id, mid, attachment, created_time)
-        if context is None:
-            logger.info(f"Ignoring unsupported attachment type: {attachment.get('type')}")
-            continue
-
-        if context["attachment_type"] == "ephemeral":
-            send_error_message(sender_id, "That media disappears after viewing, so I can't save it.")
-            _finish(mid, True)
-            return
-
-        executor.submit(_run_tracked, handle_attachment, context, mid=mid)
-        send_reaction(sender_id, mid, "love")
-
-        unprocessed_mids.delete_many({"sender_id": sender_id})
-        unprocessed_mids.insert_one({
-            "sender_id": sender_id,
-            "message": context["caption"],
-            "mid": mid,
-            "reel_id": context["reel_id"],
-            "media_id": context["media_id"],
-            "attachment_type": context["attachment_type"],
-            "link": context["url"],
-            "link_kind": context["link_kind"],
-            "created_time": created_time,
-        })
         return
 
     send_error_message(
@@ -556,6 +573,11 @@ def handle_attachment(context):
             )
             return fail("I couldn't read that one. Try forwarding it again, or reply with what it was about.")
 
+        note = (context.get("user_note") or "").strip()
+        intent = classify_note(note, description) if note else None
+        if intent:
+            logger.info(f"Note classified as {intent} for mid {mid}")
+
         payload = {
             "sender_id": sender_id,
             "message": description,
@@ -564,6 +586,10 @@ def handle_attachment(context):
             "media_id": context.get("media_id"),
             "attachment_type": context.get("attachment_type"),
             "caption": caption,
+            "user_note": note,
+            # Question reels stay indexed (they are the context for the answer)
+            # but are marked so the library can exclude them later.
+            "saved_by": "question" if intent == "question" else "forward",
             "link": url,
             "link_kind": context.get("link_kind") or _link_kind(url),
             "description_source": source,
@@ -576,6 +602,27 @@ def handle_attachment(context):
                 "Error storing embeddings for mid %s: %s", mid, response.get("error")
             )
             return fail("Error storing data, try again later")
+
+        if intent == "question":
+            # Answer from the description we just built; the reel stays indexed.
+            answer_question(sender_id, note, description, reply_to_mid=mid)
+            return True
+
+        if note and intent == "statement":
+            store_embeddings(sender_id, [{
+                "sender_id": sender_id,
+                "message": note,
+                "mid": mid,
+                "reel_id": payload["reel_id"],
+                "media_id": payload["media_id"],
+                "caption": caption,
+                "user_note": note,
+                "saved_by": "forward",
+                "link": url,
+                "link_kind": payload["link_kind"],
+                "description_source": "user_note",
+                "created_time": created_time,
+            }])
 
         if source == "gemini":
             # The index keeps the full scene description; the DM gets one line.

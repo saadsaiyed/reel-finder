@@ -7,6 +7,7 @@ from functions import (
     qdrant_client,
     find_point_by_mid,
     get_recent_conversations,
+    recent_transcript,
     unprocessed_mids,
     processed,
 )
@@ -95,17 +96,18 @@ def save_context_to_last_reel(user_id, text, mid, created_time):
         return False
 
 
-def answer_question(user_id, question, context):
-    """Answers questions based on the history of text or reel context sent before."""
+def answer_question(user_id, question, context, reply_to_mid=None):
+    """Answers questions based on the reel description and the chat transcript."""
     try:
         prompt = ANSWER_QUESTION
+        history = recent_transcript(user_id) or get_recent_conversations(user_id)
         prompt = prompt.replace("{REEL_DESCRIPTION}", context if context else "No Context Available")
-        prompt = prompt.replace("{CHAT_HISTORY}", get_recent_conversations(user_id))
+        prompt = prompt.replace("{CHAT_HISTORY}", history)
         prompt = prompt.replace("{question}", question)
-        logging.info(f"Answer Question Prompt: {prompt}")
+        logging.info(f"Answer Question Prompt: {prompt[:400]}")
         response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        logging.info(f"Gemini response: {response.text}")
-        send_error_message(user_id, response.text)
+        logging.info(f"Gemini response: {(response.text or '')[:200]}")
+        send_error_message(user_id, response.text, reply_to_mid=reply_to_mid)
         return True
     except Exception as e:
         logger.exception(f"Error in answer_question: {e}")
