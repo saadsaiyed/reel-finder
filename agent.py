@@ -1,4 +1,4 @@
-import os, logging, re
+import os, logging, re, time
 from google import genai
 from functions import (
     store_embeddings,
@@ -12,6 +12,7 @@ from functions import (
     budget_available,
     account_message,
     admin_command,
+    reel_seen_recently,
     unprocessed_mids,
     processed,
 )
@@ -178,6 +179,22 @@ def handle_text_with_gemini_agent(user_id, text, mid, created_time, replied_to_m
                 return False
             found_payload = found_point.payload
             logger.info(f"Found point with payload: {found_payload}")
+
+        # A reel just arrived but may still be uploading and describing. Wait
+        # for its point rather than answering with no context, which reads as
+        # "send it again" and is wrong when the reel is already in flight.
+        if not found_payload and not replied_to_mid and reel_seen_recently(user_id):
+            pending = unprocessed_mids.find_one({"sender_id": user_id})
+            target_mid = (pending or {}).get("mid")
+            if target_mid:
+                deadline = time.time() + 40
+                while time.time() < deadline:
+                    point = find_point_by_mid(user_id, target_mid)
+                    if point:
+                        found_payload = point.payload
+                        logger.info("Text waited for in-flight reel %s", target_mid)
+                        break
+                    time.sleep(1)
 
         # Check if the message is a question or context to save
         intent, answer = _route_text(

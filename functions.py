@@ -1,4 +1,4 @@
-import os, logging, time, asyncio, hashlib, hmac, re, tempfile, requests
+import os, logging, time, asyncio, hashlib, hmac, re, tempfile, threading, requests
 from google import genai
 from pymongo import ReturnDocument
 import uuid
@@ -318,6 +318,21 @@ def admin_command(sender_id, text):
                 f"reels today: {doc.get('reels_day_used')}")
 
     return "Unknown command. Try #help."
+
+
+def mark_reel_seen(sender_id):
+    """Record that a reel just arrived, so text can wait for its description."""
+    try:
+        accounts.update_one({"sender_id": sender_id},
+                            {"$set": {"last_reel_at": datetime.now()}}, upsert=True)
+    except Exception:
+        logger.warning("Could not mark last_reel_at", exc_info=True)
+
+
+def reel_seen_recently(sender_id, seconds=180):
+    doc = accounts.find_one({"sender_id": sender_id}, {"last_reel_at": 1}) or {}
+    ts = doc.get("last_reel_at")
+    return bool(ts) and (datetime.now() - ts).total_seconds() <= seconds
 
 
 def record_message(sender_id, role, text, mid=None):
@@ -855,8 +870,51 @@ def _auth_params():
     return params
 
 
+def send_sender_action(sender_id, action):
+    """typing_on / typing_off. Failures are logged, never raised."""
+    try:
+        requests.post(
+            f"{GRAPH}/me/messages",
+            params=_auth_params(),
+            json={"recipient": {"id": sender_id}, "sender_action": action},
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.debug(f"sender_action {action} failed: {exc}")
+
+
+_typing_stops = {}
+
+
+def start_typing(sender_id, max_seconds=120):
+    """Show the typing bubble until stop_typing or the cap, whichever comes first."""
+    stop = threading.Event()
+    _typing_stops[str(sender_id)] = stop
+
+    def loop():
+        waited = 0
+        while not stop.is_set() and waited < max_seconds:
+            send_sender_action(sender_id, "typing_on")
+            stop.wait(7)
+            waited += 7
+        # If stop_typing already cleared it, do not send a second off.
+        if not stop.is_set():
+            send_sender_action(sender_id, "typing_off")
+        _typing_stops.pop(str(sender_id), None)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def stop_typing(sender_id):
+    event = _typing_stops.pop(str(sender_id), None)
+    if event is not None:
+        event.set()
+        send_sender_action(sender_id, "typing_off")
+
+
 def send_error_message(sender_id, error_message, reply_to_mid=None):
     """Send error message(s) to user, splitting into multiple messages if needed."""
+    stop_typing(sender_id)
     # Split message if it exceeds 1000 characters
     message_chunks = split_message(error_message, max_length=1000)
 
@@ -1001,31 +1059,46 @@ def refresh_long_lived_token(force=False, min_days=30):
     return {"ok": True, "refreshed": True,
             "days_remaining": round(new_expires_in / 86400, 1)}
 
+_token_cache = {"token": None, "at": 0.0}
+_TOKEN_TTL = 60
+
+
 def get_access_token():
     """
     Retrieves the Instagram access token from the database or environment variable.
     Checks expiration and logs warning if token is expiring soon.
     If not found, returns env var as fallback.
+
+    Cached for a minute: this runs on every Graph call, including the typing
+    indicator, and a Mongo round trip there is visible as a laggy bubble.
     """
+    now = time.time()
+    if _token_cache["token"] and now - _token_cache["at"] < _TOKEN_TTL:
+        return _token_cache["token"]
+
+    token = None
     try:
-        cred = list(creds.find())
+        cred = list(creds.find().limit(1))
         if cred:
             token_doc = cred[0]
-            access_token = token_doc.get("access_token")
+            token = token_doc.get("access_token")
             expires_at = token_doc.get("expires_at")
-            
+
             # Warn if token expiring soon (within 24 hours)
             if expires_at:
                 time_until_expiry = (expires_at - datetime.now()).total_seconds()
                 if time_until_expiry < 86400:  # Less than 24 hours
                     logger.warning(f"Access token expiring soon: {time_until_expiry / 3600:.1f} hours")
-            
-            return access_token
     except Exception as e:
         logger.error(f"Error retrieving access token from database: {e}")
-    
-    # Fallback to environment variable
-    return os.getenv("INSTA_ACCESS_TOKEN")
+
+    if not token:
+        token = os.getenv("INSTA_ACCESS_TOKEN")
+
+    if token:
+        _token_cache["token"] = token
+        _token_cache["at"] = now
+    return token
 
 def run_gemini(url, is_reel):
     try:

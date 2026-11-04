@@ -1,4 +1,4 @@
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -12,6 +12,7 @@ from pymongo.errors import DuplicateKeyError
 from functions import (
     store_embeddings,
     send_similar_reel,
+    get_access_token,
     send_error_message,
     send_reaction,
     exchange_for_long_lived_token,
@@ -28,6 +29,9 @@ from functions import (
     credit_balance,
     debit_credit,
     out_of_credits_message,
+    start_typing,
+    mark_reel_seen,
+    reel_seen_recently,
     daily_summary,
     stats,
     MAX_MESSAGE_CHARS,
@@ -463,6 +467,8 @@ def _dispatch(sender_id, message, mid, created_time):
             # so it can be saved as context or answered as a question.
             context["user_note"] = text
             ensure_account(sender_id)
+            mark_reel_seen(sender_id)
+            start_typing(sender_id)
             if text:
                 record_message(sender_id, "user", text, mid)
             executor.submit(_run_tracked, handle_attachment, context, mid=mid)
@@ -494,6 +500,7 @@ def _dispatch(sender_id, message, mid, created_time):
             return
         replied_to_mid = (message.get("reply_to") or {}).get("mid")
         ensure_account(sender_id)
+        start_typing(sender_id)
         record_message(sender_id, "user", text, mid)
         executor.submit(
             _run_tracked,
@@ -1097,6 +1104,16 @@ def messages(conversation_id):
         logger.exception(f"Error importing conversation: {exc}")
         return {"error": str(exc)}, 500
 
+def _token_warmer():
+    """Keep the token cache warm so the typing bubble never waits on Mongo."""
+    while True:
+        try:
+            get_access_token()
+        except Exception:
+            pass
+        time.sleep(45)
+
+
 def _daily_digest_loop():
     """Send the usage digest once a day at or after DIGEST_HOUR (default 9)."""
     hour = int(os.environ.get("DIGEST_HOUR") or 9)
@@ -1126,6 +1143,8 @@ def _daily_digest_loop():
 
 if os.environ.get("ADMIN_IGSID"):
     threading.Thread(target=_daily_digest_loop, daemon=True).start()
+
+threading.Thread(target=_token_warmer, daemon=True).start()
 
 
 if __name__ == '__main__':
