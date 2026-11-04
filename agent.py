@@ -10,6 +10,7 @@ from functions import (
     recent_transcript,
     gemini_generate,
     budget_available,
+    account_message,
     unprocessed_mids,
     processed,
 )
@@ -32,7 +33,7 @@ def _route_text(text, reel_context, history):
     body = ((response.text if response else "") or "").strip()
     if not body:
         return None, ""
-    intent_match = re.search(r"INTENT:\s*(context|question|chat)", body, re.I)
+    intent_match = re.search(r"INTENT:\s*(context|question|account|chat)", body, re.I)
     answer_match = re.search(r"ANSWER:\s*(.*)", body, re.S | re.I)
     intent = intent_match.group(1).lower() if intent_match else None
     answer = answer_match.group(1).strip() if answer_match else ""
@@ -183,6 +184,11 @@ def handle_text_with_gemini_agent(user_id, text, mid, created_time, replied_to_m
             if found_payload:
                 return save_context_to_replied_reel(user_id, found_payload, text, mid, created_time)
             return save_context_to_last_reel(user_id, text, mid, created_time)
+
+        if intent == "account":
+            # Balance and link are built in code, never written by the model.
+            send_error_message(user_id, account_message(user_id), reply_to_mid=mid)
+            return True
 
         if intent in ("question", "chat"):
             reply = answer or (

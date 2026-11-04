@@ -1,9 +1,9 @@
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
 load_dotenv(override=True)
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, redirect
 from flask_cors import CORS
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +25,9 @@ from functions import (
     ensure_account,
     record_message,
     check_user_limit,
+    credit_balance,
+    debit_credit,
+    out_of_credits_message,
     MAX_MESSAGE_CHARS,
     _is_permalink,
     _auth_params,
@@ -539,6 +542,10 @@ def handle_attachment(context):
         send_error_message(sender_id, message)
         return False
 
+    # Refuse before any download or model call when the account is empty.
+    if credit_balance(sender_id) < 1:
+        return fail(out_of_credits_message(sender_id))
+
     try:
         description = ""
         source = "caption"
@@ -620,11 +627,13 @@ def handle_attachment(context):
             )
             return fail("Error storing data, try again later")
 
+        # The reel is in the index; charge for it now. A replay is a no-op.
+        debit_credit(sender_id, mid)
+
         if intent == "question":
             # Answer from the description we just built; the reel stays indexed.
             answer_question(sender_id, note, description, reply_to_mid=mid)
             return True
-
         if note and intent == "statement":
             store_embeddings(sender_id, [{
                 "sender_id": sender_id,
@@ -749,6 +758,32 @@ def home():
 
     return render_template("index.html", login_link=None)
 
+@app.route("/oauth/start", methods=["GET"])
+def oauth_start():
+    """Start the operator token flow. Only this route may set the state cookie."""
+    client_id = os.environ.get("INSTA_CLIENT_ID")
+    redirect_uri = os.environ.get("INSTA_REDIRECT_URI")
+    if not client_id or not redirect_uri:
+        return {"error": "INSTA_CLIENT_ID and INSTA_REDIRECT_URI are required"}, 503
+
+    state = secrets.token_urlsafe(24)
+    scopes = os.environ.get("INSTA_SCOPES") or (
+        "instagram_business_basic,instagram_business_manage_messages"
+    )
+    authorize = (
+        "https://www.instagram.com/oauth/authorize"
+        f"?force_reauth=true&client_id={client_id}"
+        f"&redirect_uri={redirect_uri}&response_type=code"
+        f"&scope={scopes}&state={state}"
+    )
+    response = redirect(authorize)
+    response.set_cookie(
+        "oauth_state", state, max_age=600, httponly=True, secure=True,
+        samesite="Lax", path="/",
+    )
+    return response
+
+
 @app.route("/callback", methods=["GET"])
 def callback():
     """
@@ -759,6 +794,14 @@ def callback():
     try:
         # Get authorization code from URL parameters
         code = request.args.get("code")
+
+        # Without a matching state cookie anyone holding a valid code could
+        # swap the bot's token. The cookie is only set by /oauth/start.
+        state = request.args.get("state") or ""
+        expected_state = request.cookies.get("oauth_state") or ""
+        if not state or not expected_state or not hmac.compare_digest(state, expected_state):
+            logger.warning("OAuth callback rejected: state missing or mismatched")
+            return {"error": "invalid or missing state", "status": "failed"}, 403
 
         if not code:
             logger.error("No authorization code in callback")
@@ -806,6 +849,17 @@ def callback():
 
         short_lived_token = short_lived_data.get("access_token")
         user_id = short_lived_data.get("user_id")
+
+        # Only the configured bot account may become the stored token.
+        expected_ig_id = os.environ.get("IG_ID")
+        if expected_ig_id and str(user_id) != str(expected_ig_id):
+            logger.error(
+                f"OAuth callback rejected: account {user_id} is not the configured {expected_ig_id}"
+            )
+            return {
+                "error": "this Instagram account is not the configured bot account",
+                "status": "failed",
+            }, 403
 
         logger.info(f"✓ Short-lived token obtained for user: {user_id}")
         logger.debug(f"Short-lived response: {short_lived_data}")

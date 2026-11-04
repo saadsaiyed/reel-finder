@@ -1,5 +1,6 @@
 import os, logging, time, asyncio, hashlib, hmac, re, tempfile, requests
 from google import genai
+from pymongo import ReturnDocument
 import uuid
 import yt_dlp
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -32,6 +33,7 @@ processed = db_client["master"]["processed_mids"]
 unprocessed_mids = db_client["master"]["unprocessed_mids"]
 messages_col = db_client["master"]["messages"]
 accounts = db_client["master"]["accounts"]
+credit_ledger = db_client["master"]["credit_ledger"]
 
 
 # --------------------------------------------------------------------------
@@ -39,6 +41,10 @@ accounts = db_client["master"]["accounts"]
 # --------------------------------------------------------------------------
 
 TRANSCRIPT_TURNS = 20
+
+# Freemium allowance. One reel saved costs one credit.
+FREE_REELS_ANON = int(os.environ.get("FREE_REELS_ANON") or 10)
+FREE_REELS_LINKED = int(os.environ.get("FREE_REELS_LINKED") or 10)
 
 # Abuse limits. Every one is env-tunable so you can change them in CasaOS
 # without a rebuild.
@@ -107,19 +113,106 @@ def check_user_limit(sender_id, kind):
 
 
 def ensure_account(sender_id):
-    """One record per Instagram sender; the future paywall hangs off this."""
+    """Create the account on first contact and grant the anonymous allowance."""
     try:
-        accounts.update_one(
+        doc = accounts.find_one_and_update(
             {"sender_id": sender_id},
             {
                 "$setOnInsert": {"plan": "free", "status": "active",
-                                 "created_at": datetime.now()},
+                                 "created_at": datetime.now(),
+                                 "credits": FREE_REELS_ANON},
                 "$set": {"last_seen": datetime.now()},
             },
             upsert=True,
+            return_document=ReturnDocument.AFTER,
         )
+        # Accounts created before credits existed get the same allowance once.
+        accounts.update_one(
+            {"sender_id": sender_id, "credits": {"$exists": False}},
+            {"$set": {"credits": FREE_REELS_ANON}},
+        )
+        return doc
     except Exception:
         logger.warning("Could not upsert account record", exc_info=True)
+        return None
+
+
+def credit_balance(sender_id):
+    doc = accounts.find_one({"sender_id": sender_id}, {"credits": 1})
+    return int((doc or {}).get("credits", 0))
+
+
+def _log_credit(sender_id, delta, reason, ref, balance):
+    try:
+        credit_ledger.insert_one({
+            "sender_id": sender_id, "delta": delta, "reason": reason,
+            "ref": ref, "balance_after": balance, "created_at": datetime.now(),
+        })
+    except Exception:
+        logger.warning("Could not write credit ledger row", exc_info=True)
+
+
+def debit_credit(sender_id, ref=None):
+    """Charge one credit atomically.
+
+    Returns the new balance, the current balance if this ref was already
+    charged, or False when the account is empty.
+    """
+    if ref and credit_ledger.find_one({"sender_id": sender_id, "ref": ref,
+                                       "delta": -1}):
+        return credit_balance(sender_id)
+    doc = accounts.find_one_and_update(
+        {"sender_id": sender_id, "credits": {"$gte": 1}},
+        {"$inc": {"credits": -1}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if doc is None:
+        return False
+    balance = int(doc.get("credits", 0))
+    _log_credit(sender_id, -1, "consume", ref, balance)
+    return balance
+
+
+def grant_credits(sender_id, units, reason, ref=None):
+    """Add credits. Idempotent when ref is supplied."""
+    if ref and credit_ledger.find_one({"sender_id": sender_id, "ref": ref,
+                                       "reason": reason}):
+        return credit_balance(sender_id)
+    doc = accounts.find_one_and_update(
+        {"sender_id": sender_id},
+        {"$inc": {"credits": int(units)}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    balance = int(doc.get("credits", 0))
+    _log_credit(sender_id, int(units), reason, ref, balance)
+    return balance
+
+
+def buy_link(sender_id, ttl=24 * 3600):
+    """Signed, short-lived upgrade link so a forwarded DM cannot probe others."""
+    base = os.environ.get("PUBLIC_SITE_URL") or "https://reelmark.io"
+    secret = os.environ.get("FLASK_SECRET_KEY") or ""
+    expires = int(time.time()) + ttl
+    sig = hmac.new(secret.encode(), f"{sender_id}:{expires}".encode(),
+                   hashlib.sha256).hexdigest()[:32]
+    return f"{base}/upgrade?u={sender_id}&e={expires}&s={sig}"
+
+
+def account_message(sender_id):
+    """Deterministic account reply; the model never writes the balance or URL."""
+    doc = accounts.find_one({"sender_id": sender_id}) or {}
+    plan = doc.get("plan") or "free"
+    credits = int(doc.get("credits", 0))
+    noun = "reel" if credits == 1 else "reels"
+    return (f"You have {credits} {noun} left on the {plan} plan.\n"
+            "Search and questions are free and unlimited.\n"
+            f"Top up or change plan: {buy_link(sender_id)}")
+
+
+def out_of_credits_message(sender_id):
+    return ("You're out of reels for now. Search and questions stay free.\n"
+            f"Get more reels: {buy_link(sender_id)}")
 
 
 def record_message(sender_id, role, text, mid=None):
