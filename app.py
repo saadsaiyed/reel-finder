@@ -1,4 +1,4 @@
-VERSION = "1.14.0"
+VERSION = "1.14.1"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -514,7 +514,8 @@ def _forward_to_hermes(sender_id, text, mid):
         return
     try:
         resp = requests.post(f"{url}/ask", headers={"X-Bridge-Token": token},
-                             json={"igsid": sender_id, "text": payload}, timeout=20)
+                             json={"igsid": sender_id, "text": payload, "mid": mid},
+                             timeout=20)
         if resp.status_code in (200, 202):
             send_error_message(sender_id, "Sent to Hermes. I'll reply here when it's done.")
         elif resp.status_code == 429:
