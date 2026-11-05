@@ -1,4 +1,4 @@
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -37,6 +37,7 @@ from functions import (
     stats,
     accounts,
     FREE_REELS_LINKED,
+    is_admin,
     MAX_MESSAGE_CHARS,
     _is_permalink,
     _auth_params,
@@ -301,6 +302,24 @@ _seed_token_from_env()
 threading.Thread(target=_token_health_loop, name="token-health", daemon=True).start()
 
 
+@app.route("/internal/send", methods=["POST"])
+def internal_send():
+    """Deliver a DM on behalf of the bridge or an admin. Service token only."""
+    expected = os.environ.get("SERVICE_TOKEN")
+    provided = request.headers.get("X-Service-Token") or ""
+    if not expected or not hmac.compare_digest(provided, expected):
+        return {"error": "unauthorized"}, 401
+
+    data = request.get_json(silent=True) or {}
+    igsid = str(data.get("igsid") or "").strip()
+    text = (data.get("text") or "").strip()
+    if not igsid or not text:
+        return {"error": "igsid and text are required"}, 400
+
+    ok = send_error_message(igsid, text[:3500])
+    return {"ok": bool(ok)}, 200
+
+
 @app.route("/internal/account/<igsid>", methods=["GET"])
 def internal_account(igsid):
     """Balance for the site's account page. Service token only."""
@@ -480,6 +499,35 @@ def _attachment_context(sender_id, mid, attachment, created_time):
     }
 
 
+def _forward_to_hermes(sender_id, text, mid):
+    """Admin-only: send the text to the local Hermes bridge."""
+    url = (os.environ.get("BRIDGE_URL") or "").rstrip("/")
+    token = os.environ.get("BRIDGE_TOKEN") or ""
+    payload = text.split(" ", 1)[1].strip() if " " in text else ""
+    if not payload:
+        send_error_message(sender_id, "Usage: h <message for Hermes>")
+        _finish(mid, True)
+        return
+    if not url or not token:
+        send_error_message(sender_id, "The Hermes bridge is not configured.")
+        _finish(mid, True)
+        return
+    try:
+        resp = requests.post(f"{url}/ask", headers={"X-Bridge-Token": token},
+                             json={"igsid": sender_id, "text": payload}, timeout=20)
+        if resp.status_code in (200, 202):
+            send_error_message(sender_id, "Sent to Hermes. I'll reply here when it's done.")
+        elif resp.status_code == 429:
+            send_error_message(sender_id, "Hermes is busy with an earlier message. Try again shortly.")
+        elif resp.status_code == 401:
+            send_error_message(sender_id, "The bridge token is wrong. Check BRIDGE_TOKEN.")
+        else:
+            send_error_message(sender_id, "The bridge refused that message.")
+    except requests.RequestException:
+        send_error_message(sender_id, "The Hermes bridge is unreachable.")
+    _finish(mid, True)
+
+
 def _handle_link_code(sender_id, text, mid):
     """A LINK-XXXX code proves the DM sender owns the site account."""
     site = (os.environ.get("PUBLIC_SITE_URL") or "https://reelmark.saadsaiyed.com").rstrip("/")
@@ -574,6 +622,10 @@ def _dispatch(sender_id, message, mid, created_time):
             _finish(mid, True)
             return
         replied_to_mid = (message.get("reply_to") or {}).get("mid")
+        if is_admin(sender_id) and text.lower().startswith(("h ", "hermes ")):
+            ensure_account(sender_id)
+            _forward_to_hermes(sender_id, text, mid)
+            return
         if text.lower().startswith("link-"):
             ensure_account(sender_id)
             _handle_link_code(sender_id, text, mid)
