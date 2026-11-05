@@ -191,7 +191,7 @@ def grant_credits(sender_id, units, reason, ref=None):
 
 def buy_link(sender_id, ttl=24 * 3600):
     """Signed, short-lived upgrade link so a forwarded DM cannot probe others."""
-    base = os.environ.get("PUBLIC_SITE_URL") or "https://reelmark.io"
+    base = os.environ.get("PUBLIC_SITE_URL") or "https://reelmark.saadsaiyed.com"
     secret = os.environ.get("FLASK_SECRET_KEY") or ""
     expires = int(time.time()) + ttl
     sig = hmac.new(secret.encode(), f"{sender_id}:{expires}".encode(),
