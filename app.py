@@ -1,4 +1,4 @@
-VERSION = "1.12.1"
+VERSION = "1.13.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -35,6 +35,8 @@ from functions import (
     reel_seen_recently,
     daily_summary,
     stats,
+    accounts,
+    FREE_REELS_LINKED,
     MAX_MESSAGE_CHARS,
     _is_permalink,
     _auth_params,
@@ -299,6 +301,18 @@ _seed_token_from_env()
 threading.Thread(target=_token_health_loop, name="token-health", daemon=True).start()
 
 
+@app.route("/internal/account/<igsid>", methods=["GET"])
+def internal_account(igsid):
+    """Balance for the site's account page. Service token only."""
+    expected = os.environ.get("SERVICE_TOKEN")
+    provided = request.headers.get("X-Service-Token") or ""
+    if not expected or not hmac.compare_digest(provided, expected):
+        return {"error": "unauthorized"}, 401
+    doc = accounts.find_one({"sender_id": igsid}) or {}
+    return {"igsid": igsid, "credits": int(doc.get("credits", 0)),
+            "plan": doc.get("plan") or "free"}, 200
+
+
 @app.route("/internal/credit", methods=["POST"])
 def internal_credit():
     """Grant credits from the site after a Stripe payment. Service token only."""
@@ -466,6 +480,39 @@ def _attachment_context(sender_id, mid, attachment, created_time):
     }
 
 
+def _handle_link_code(sender_id, text, mid):
+    """A LINK-XXXX code proves the DM sender owns the site account."""
+    site = (os.environ.get("PUBLIC_SITE_URL") or "https://reelmark.saadsaiyed.com").rstrip("/")
+    token = os.environ.get("SERVICE_TOKEN")
+    ok = False
+    if token:
+        try:
+            resp = requests.post(f"{site}/internal/link",
+                                 headers={"X-Service-Token": token},
+                                 json={"igsid": sender_id, "code": text.strip()},
+                                 timeout=15)
+            ok = resp.status_code == 200
+            if not ok:
+                logger.info(f"Link code refused: {resp.status_code}")
+        except requests.RequestException as exc:
+            logger.warning(f"Link code call failed: {exc}")
+
+    if ok:
+        ensure_account(sender_id)
+        grant_credits(sender_id, FREE_REELS_LINKED, "link", ref=f"link:{sender_id}")
+        send_error_message(
+            sender_id,
+            f"Linked. You have {credit_balance(sender_id)} reels to save. "
+            f"Your account: {site}/account",
+        )
+    else:
+        send_error_message(
+            sender_id,
+            f"That code didn't work. Get a fresh one at {site}/account",
+        )
+    _finish(mid, True)
+
+
 def _dispatch(sender_id, message, mid, created_time):
     text = (message.get("text") or "").strip()
     attachments = message.get("attachments") or []
@@ -527,6 +574,10 @@ def _dispatch(sender_id, message, mid, created_time):
             _finish(mid, True)
             return
         replied_to_mid = (message.get("reply_to") or {}).get("mid")
+        if text.lower().startswith("link-"):
+            ensure_account(sender_id)
+            _handle_link_code(sender_id, text, mid)
+            return
         ensure_account(sender_id)
         start_typing(sender_id)
         record_message(sender_id, "user", text, mid)
