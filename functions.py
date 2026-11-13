@@ -335,6 +335,34 @@ def reel_seen_recently(sender_id, seconds=180):
     return bool(ts) and (datetime.now() - ts).total_seconds() <= seconds
 
 
+def send_button(sender_id, text, buttons):
+    """A message with tappable buttons. buttons: [(title, url)] or [(title, payload)]."""
+    built = []
+    for title, target in buttons[:3]:
+        if str(target).startswith("http"):
+            built.append({"type": "web_url", "url": target, "title": title[:20]})
+        else:
+            built.append({"type": "postback", "payload": target, "title": title[:20]})
+    body = {
+        "recipient": {"id": sender_id},
+        "message": {"attachment": {"type": "template", "payload": {
+            "template_type": "button",
+            "text": text[:640],
+            "buttons": built,
+        }}},
+    }
+    try:
+        resp = requests.post(f"{GRAPH}/me/messages", params=_auth_params(),
+                             json=body, timeout=20)
+        if resp.status_code != 200:
+            logger.warning("button template rejected: %s %s", resp.status_code, resp.text[:200])
+            return send_error_message(sender_id, text)
+        return True
+    except requests.RequestException as exc:
+        logger.warning("button template failed: %s", exc)
+        return send_error_message(sender_id, text)
+
+
 def send_quick_replies(sender_id, text, buttons):
     """Onboarding buttons. Each button sends its payload back as a message."""
     body = {
@@ -397,8 +425,7 @@ ONBOARD_TEXT = {
     "ONBOARD_HOW": (
         "Three steps. Forward any reel to me, I write down what happens in it, "
         "then you describe it later and I send it back.\n\n"
-        f"Search is free forever. Saving costs one reel from your balance, and you start with ten.\n\n"
-        f"Everything else is at {SITE}"
+        "Search is free forever. Saving costs one reel from your balance, and you start with ten."
     ),
     "ONBOARD_SEND": (
         "Open the reel, tap the share arrow, and pick @reelmark_ai. "
@@ -411,12 +438,11 @@ ONBOARD_TEXT = {
     "ONBOARD_PRICE": (
         "Ten reels free, plus ten more when you link an account on the site. "
         "Then $3.99 for the first month (20 reels), $9.99 for 40 a month, "
-        "$19.99 for 100. Search never costs anything.\n\n"
-        f"Full details: {SITE}"
+        "$19.99 for 100. Search never costs anything."
     ),
     "ONBOARD_SITE": (
-        f"Your balance and saved reels live at {SITE}/account.\n\n"
-        "Sign in with email or Google, then send me the LINK- code it shows and the two are connected."
+        "Your balance and saved reels live on the site. Sign in with email or Google, "
+        "then send me the LINK- code it shows and the two are connected."
     ),
 }
 
@@ -431,10 +457,14 @@ def welcome(sender_id):
 
 
 def onboarding_reply(sender_id, code):
-    """Answer a quick-reply tap, then re-offer the buttons."""
+    """Answer a quick-reply or ice-breaker tap."""
     body = ONBOARD_TEXT.get(code)
     if not body:
         return False
+    if code == "ONBOARD_SITE":
+        return send_button(sender_id, body, [("Open my account", f"{SITE}/account")])
+    if code in ("ONBOARD_HOW", "ONBOARD_PRICE"):
+        return send_button(sender_id, body, [("Open reelmark", SITE)])
     return send_quick_replies(sender_id, body, ONBOARD_BUTTONS)
 
 
