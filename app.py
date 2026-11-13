@@ -1,4 +1,4 @@
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -635,6 +635,13 @@ def _dispatch(sender_id, message, mid, created_time):
             ensure_account(sender_id)
             onboarding_reply(sender_id, code)
             record_message(sender_id, "user", text or code, mid)
+            _finish(mid, True)
+            return
+
+        if not code and text.lower().strip() in ("start", "menu", "help") and not is_admin(sender_id):
+            ensure_account(sender_id)
+            welcome(sender_id)
+            record_message(sender_id, "user", text, mid)
             _finish(mid, True)
             return
 
