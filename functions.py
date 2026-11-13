@@ -366,11 +366,37 @@ ONBOARD_BUTTONS = [
     ("Pricing", "ONBOARD_PRICE"),
 ]
 
+SITE = os.environ.get("PUBLIC_SITE_URL") or "https://reelmark.saadsaiyed.com"
+
+# Shown by Instagram while the thread is still empty, before the user types.
+ICEBREAKERS = [
+    {"question": "How does this work?", "payload": "ONBOARD_HOW"},
+    {"question": "What does it cost?", "payload": "ONBOARD_PRICE"},
+    {"question": "How do I search my reels?", "payload": "ONBOARD_SEARCH"},
+    {"question": "Where is my account?", "payload": "ONBOARD_SITE"},
+]
+
+
+def set_ice_breakers():
+    """Register the prompts that appear in an empty DM thread."""
+    body = {"platform": "instagram",
+            "ice_breakers": [{"call_to_actions": ICEBREAKERS}]}
+    try:
+        resp = requests.post(f"{GRAPH}/{os.environ.get('IG_ID')}/messenger_profile",
+                             params=_auth_params(), json=body, timeout=25)
+        logger.info("ice breakers: %s %s", resp.status_code, resp.text[:200])
+        return resp.status_code == 200
+    except requests.RequestException as exc:
+        logger.warning("ice breakers failed: %s", exc)
+        return False
+
+
 ONBOARD_TEXT = {
     "ONBOARD_HOW": (
         "Three steps. Forward any reel to me, I write down what happens in it, "
         "then you describe it later and I send it back.\n\n"
-        "Search is free forever. Saving costs one reel from your balance, and you start with ten."
+        f"Search is free forever. Saving costs one reel from your balance, and you start with ten.\n\n"
+        f"Everything else is at {SITE}"
     ),
     "ONBOARD_SEND": (
         "Open the reel, tap the share arrow, and pick @reelmark_ai. "
@@ -383,7 +409,12 @@ ONBOARD_TEXT = {
     "ONBOARD_PRICE": (
         "Ten reels free, plus ten more when you link an account on the site. "
         "Then $3.99 for the first month (20 reels), $9.99 for 40 a month, "
-        "$19.99 for 100. Search never costs anything."
+        "$19.99 for 100. Search never costs anything.\n\n"
+        f"Full details: {SITE}"
+    ),
+    "ONBOARD_SITE": (
+        f"Your balance and saved reels live at {SITE}/account.\n\n"
+        "Sign in with email or Google, then send me the LINK- code it shows and the two are connected."
     ),
 }
 

@@ -1,4 +1,4 @@
-VERSION = "1.16.1"
+VERSION = "1.17.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -41,6 +41,7 @@ from functions import (
     welcome,
     onboarding_reply,
     ONBOARD_TEXT,
+    set_ice_breakers,
     MAX_MESSAGE_CHARS,
     _is_permalink,
     _auth_params,
@@ -429,6 +430,26 @@ def _handle_messaging(messaging, created_time):
     sender_id = (messaging.get("sender") or {}).get("id")
     message = messaging.get("message") or {}
     mid = message.get("mid")
+
+    # Ice breaker taps arrive as postbacks, not messages.
+    postback = messaging.get("postback") or {}
+    if postback and not message:
+        payload = (postback.get("payload") or "").strip()
+        if not sender_id or sender_id == os.environ.get("IG_ID"):
+            return
+        pb_mid = postback.get("mid") or f"pb:{sender_id}:{int(time.time() * 1000)}"
+        if not _claim(pb_mid):
+            return
+        try:
+            logger.info(f"Postback {payload} from {sender_id}")
+            if payload in ONBOARD_TEXT or payload.startswith("ONBOARD_"):
+                ensure_account(sender_id)
+                onboarding_reply(sender_id, payload)
+            _finish(pb_mid, True)
+        except Exception:
+            _release(pb_mid)
+            logger.exception(f"Failed to handle postback {payload}")
+        return
 
     if not sender_id or not mid:
         logger.warning("Messaging event without sender or mid; ignored")
@@ -1307,6 +1328,7 @@ if os.environ.get("ADMIN_IGSID"):
     threading.Thread(target=_daily_digest_loop, daemon=True).start()
 
 threading.Thread(target=_token_warmer, daemon=True).start()
+threading.Thread(target=set_ice_breakers, daemon=True).start()
 
 
 if __name__ == '__main__':
