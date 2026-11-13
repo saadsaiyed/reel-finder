@@ -379,8 +379,10 @@ ICEBREAKERS = [
 
 def set_ice_breakers():
     """Register the prompts that appear in an empty DM thread."""
-    body = {"platform": "instagram",
-            "ice_breakers": [{"call_to_actions": ICEBREAKERS}]}
+    # Instagram wants a flat (question, payload) list. The nested
+    # call_to_actions form is Messenger's and is rejected with
+    # "Invalid Icebreaker Schema" (subcode 2534058).
+    body = {"platform": "instagram", "ice_breakers": ICEBREAKERS}
     try:
         resp = requests.post(f"{GRAPH}/{os.environ.get('IG_ID')}/messenger_profile",
                              params=_auth_params(), json=body, timeout=25)
