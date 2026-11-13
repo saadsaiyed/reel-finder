@@ -1,4 +1,4 @@
-VERSION = "1.17.2"
+VERSION = "1.17.3"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -42,6 +42,7 @@ from functions import (
     onboarding_reply,
     ONBOARD_TEXT,
     set_ice_breakers,
+    send_email,
     MAX_MESSAGE_CHARS,
     _is_permalink,
     _auth_params,
@@ -1313,9 +1314,19 @@ def _daily_digest_loop():
                 else:
                     try:
                         text = daily_summary(day)
-                        send_error_message(admin, text)
+                        via = "instagram"
+                        delivered = send_error_message(admin, text)
+                        if not delivered:
+                            # Instagram blocks bot-initiated DMs outside a 24h
+                            # window, which makes a daily push unreliable.
+                            delivered = send_email(
+                                os.environ.get("DIGEST_EMAIL") or "",
+                                f"Reelmark digest - {day}", text)
+                            via = "email" if delivered else "none"
                         _notify(text.replace("\n", " | "))
-                        logger.info(f"Daily digest sent for {day}")
+                        stats.update_one({"_id": marker},
+                                         {"$set": {"via": via, "delivered": bool(delivered)}})
+                        logger.info(f"Daily digest for {day} via {via} (delivered={delivered})")
                     except Exception:
                         stats.delete_one({"_id": marker})
                         raise

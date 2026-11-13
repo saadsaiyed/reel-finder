@@ -363,6 +363,33 @@ def send_button(sender_id, text, buttons):
         return send_error_message(sender_id, text)
 
 
+def send_email(to_addr, subject, body):
+    """Plain email fallback for things Instagram will not let us push."""
+    host = os.environ.get("SMTP_HOST") or "smtp.dreamhost.com"
+    user = os.environ.get("SMTP_USER") or "info@noohsolutions.ca"
+    password = os.environ.get("SMTP_PASS")
+    if not password or not to_addr:
+        logger.warning("email not configured (SMTP_PASS or DIGEST_EMAIL missing)")
+        return False
+    try:
+        import smtplib
+        from email.message import EmailMessage
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = os.environ.get("SMTP_FROM") or f"Reelmark <{user}>"
+        msg["To"] = to_addr
+        msg.set_content(body)
+        with smtplib.SMTP(host, int(os.environ.get("SMTP_PORT") or 587), timeout=20) as smtp:
+            smtp.starttls()
+            smtp.login(user, password)
+            smtp.send_message(msg)
+        logger.info(f"email sent to {to_addr}: {subject}")
+        return True
+    except Exception as exc:
+        logger.warning(f"email failed: {exc}")
+        return False
+
+
 def send_quick_replies(sender_id, text, buttons):
     """Onboarding buttons. Each button sends its payload back as a message."""
     body = {
