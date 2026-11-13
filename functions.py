@@ -749,11 +749,28 @@ def _send_video(sender_id, link, reply_to_mid=None):
     return ok
 
 
+def saved_reel_count(sender_id):
+    """How many reels this sender has indexed. 0 also means no collection."""
+    try:
+        info = qdrant_client.get_collection(sender_id)
+        return int(getattr(info, "points_count", 0) or 0)
+    except Exception:
+        return 0
+
+
 def send_similar_reel(sender_id, text):
     try:
         logger.info("Started send_similar_reel")
+        if saved_reel_count(sender_id) == 0:
+            send_error_message(
+                sender_id,
+                "You haven't saved any reels yet. Forward one to me and I'll remember it, "
+                "then search works on your own library.",
+            )
+            return {"message": "Empty library"}
         results = get_similar_messages(collection_name=sender_id, text=text)
         if isinstance(results, dict) and results.get("error"):
+            send_error_message(sender_id, "I couldn't search just now. Try again in a moment.")
             return results
         if not isinstance(results, list):
             return {"error": "Error retrieving similar messages."}

@@ -12,6 +12,7 @@ from functions import (
     budget_available,
     account_message,
     admin_command,
+    saved_reel_count,
     reel_seen_recently,
     unprocessed_mids,
     processed,
@@ -98,10 +99,17 @@ def save_context_to_last_reel(user_id, text, mid, created_time):
     try:
         user = unprocessed_mids.find_one({"sender_id": user_id})
         if not user:
-            send_error_message(
-                user_id,
-                "If you want to search for a similar reel, please use the command `search <your query>`",
-            )
+            if saved_reel_count(user_id) == 0:
+                send_error_message(
+                    user_id,
+                    "You haven't saved any reels yet. Forward one to me and I'll remember it. "
+                    "Search is free once you have a library.",
+                )
+            else:
+                send_error_message(
+                    user_id,
+                    "If you want to search for a similar reel, please use the command `search <your query>`",
+                )
             return False
 
         from datetime import datetime

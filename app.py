@@ -1,4 +1,4 @@
-VERSION = "1.14.1"
+VERSION = "1.15.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
