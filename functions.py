@@ -335,6 +335,76 @@ def reel_seen_recently(sender_id, seconds=180):
     return bool(ts) and (datetime.now() - ts).total_seconds() <= seconds
 
 
+def send_quick_replies(sender_id, text, buttons):
+    """Onboarding buttons. Each button sends its payload back as a message."""
+    body = {
+        "recipient": {"id": sender_id},
+        "message": {
+            "text": text,
+            "quick_replies": [
+                {"content_type": "text", "title": title[:20], "payload": payload}
+                for title, payload in buttons
+            ],
+        },
+    }
+    try:
+        resp = requests.post(f"{GRAPH}/me/messages", params=_auth_params(),
+                             json=body, timeout=20)
+        if resp.status_code != 200:
+            logger.warning("quick replies rejected: %s %s", resp.status_code, resp.text[:160])
+            return send_error_message(sender_id, text)
+        return True
+    except requests.RequestException as exc:
+        logger.warning("quick replies failed: %s", exc)
+        return send_error_message(sender_id, text)
+
+
+ONBOARD_BUTTONS = [
+    ("How it works", "ONBOARD_HOW"),
+    ("Send my first reel", "ONBOARD_SEND"),
+    ("Search", "ONBOARD_SEARCH"),
+    ("Pricing", "ONBOARD_PRICE"),
+]
+
+ONBOARD_TEXT = {
+    "ONBOARD_HOW": (
+        "Three steps. Forward any reel to me, I write down what happens in it, "
+        "then you describe it later and I send it back.\n\n"
+        "Search is free forever. Saving costs one reel from your balance, and you start with ten."
+    ),
+    "ONBOARD_SEND": (
+        "Open the reel, tap the share arrow, and pick @reelmark_ai. "
+        "I'll read it and tell you what I saw."
+    ),
+    "ONBOARD_SEARCH": (
+        "Type `search` and then whatever you remember, however vague. "
+        "For example: `search the pasta place with the orange awning`."
+    ),
+    "ONBOARD_PRICE": (
+        "Ten reels free, plus ten more when you link an account on the site. "
+        "Then $3.99 for the first month (20 reels), $9.99 for 40 a month, "
+        "$19.99 for 100. Search never costs anything."
+    ),
+}
+
+
+def welcome(sender_id):
+    return send_quick_replies(
+        sender_id,
+        "I keep the reels you send me, so you can find them later by describing them. "
+        "Search is free forever. Where do you want to start?",
+        ONBOARD_BUTTONS,
+    )
+
+
+def onboarding_reply(sender_id, code):
+    """Answer a quick-reply tap, then re-offer the buttons."""
+    body = ONBOARD_TEXT.get(code)
+    if not body:
+        return False
+    return send_quick_replies(sender_id, body, ONBOARD_BUTTONS)
+
+
 def record_message(sender_id, role, text, mid=None):
     """Append to the per-sender transcript, keeping the newest 20 turns."""
     text = (text or "").strip()

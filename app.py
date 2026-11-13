@@ -1,4 +1,4 @@
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 import requests, os, secrets, logging, threading, time, hmac, hashlib
 from functools import wraps
 from dotenv import load_dotenv
@@ -38,6 +38,9 @@ from functions import (
     accounts,
     FREE_REELS_LINKED,
     is_admin,
+    welcome,
+    onboarding_reply,
+    ONBOARD_TEXT,
     MAX_MESSAGE_CHARS,
     _is_permalink,
     _auth_params,
@@ -623,6 +626,26 @@ def _dispatch(sender_id, message, mid, created_time):
             _finish(mid, True)
             return
         replied_to_mid = (message.get("reply_to") or {}).get("mid")
+
+        # Quick-reply taps arrive as a payload, sometimes with the button title
+        # as text. Handle both, before the model sees anything.
+        qr = (message.get("quick_reply") or {}).get("payload") or ""
+        code = qr if qr in ONBOARD_TEXT else (text if text in ONBOARD_TEXT else "")
+        if code:
+            ensure_account(sender_id)
+            onboarding_reply(sender_id, code)
+            record_message(sender_id, "user", text or code, mid)
+            _finish(mid, True)
+            return
+
+        existing = accounts.find_one({"sender_id": sender_id}, {"_id": 1})
+        ensure_account(sender_id)
+        if not existing and not is_admin(sender_id):
+            welcome(sender_id)
+            record_message(sender_id, "user", text, mid)
+            _finish(mid, True)
+            return
+
         if is_admin(sender_id) and text.lower().startswith(("h ", "hermes ")):
             ensure_account(sender_id)
             _forward_to_hermes(sender_id, text, mid)
