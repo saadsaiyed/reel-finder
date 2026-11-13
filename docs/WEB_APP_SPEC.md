@@ -38,7 +38,7 @@ be told which IGSID belongs to which user, by proof of control:
 1. Signed-in user opens "Connect Instagram".
 2. Site issues a code, e.g. `LINK-7F3K` — 6 characters from an unambiguous
    alphabet, 10 minute expiry, one active code per user.
-3. User DMs that code to `@reel_finder_nooh`.
+3. User DMs that code to `@reelmark_ai`.
 4. Bot recognises `LINK-` in the message text and calls
    `POST /internal/link` on the site with `{igsid, code}` and the service token.
 5. Site validates the code, writes `ig_links`, and the bot replies
