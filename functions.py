@@ -950,11 +950,20 @@ def send_similar_reel(sender_id, text):
         # the scheme, then the match on a second line.
         if link and link_kind == "permalink":
             short = re.sub(r"^https?://(www\.)?", "", link).rstrip("/")
+            # 1. the link, on its own
             send_error_message(sender_id, short, reply_to_mid=original_mid)
+            # 2. what the reel was, threaded to the original forward
             if description:
                 send_error_message(sender_id, f"Closest match: {description}",
                                    reply_to_mid=original_mid)
-            return {"message": "Link then description"}
+            # 3. the media itself, best effort: a restricted or rate-limited
+            #    permalink still leaves the user with the two messages above.
+            media_url, resolve_error = resolve_media_url(link)
+            if media_url and _send_video(sender_id, media_url, reply_to_mid=original_mid):
+                return {"message": "Link, description, video"}
+            if resolve_error:
+                logger.info(f"Media not sent after link ({resolve_error}) for {link}")
+            return {"message": "Link and description"}
 
         if link and _send_video(sender_id, link, reply_to_mid=original_mid):
             return {"message": "Reel sent"}
