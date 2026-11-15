@@ -946,18 +946,15 @@ def send_similar_reel(sender_id, text):
         # Replying to the user's original forward keeps the video in context.
         original_mid = payload.get("mid")
 
-        # A permalink opens the reel inside Instagram; it is not a media URL. Get
-        # a fresh signed CDN URL and send the video inline so the user does not
-        # have to open a browser.
+        # A permalink is what people can open. Send it first, bare and without
+        # the scheme, then the match on a second line.
         if link and link_kind == "permalink":
-            media_url, resolve_error = resolve_media_url(link)
-            if media_url and _send_video(sender_id, media_url, reply_to_mid=original_mid):
-                return {"message": "Reel sent inline"}
-            if resolve_error in ("rate_limited", "restricted"):
-                logger.info(f"Inline send unavailable ({resolve_error}); sending link for {link}")
-            body = f"Closest match: {description}\n\n{link}" if description else f"Closest match:\n{link}"
-            send_error_message(sender_id, body.strip(), reply_to_mid=original_mid)
-            return {"message": "Link sent"}
+            short = re.sub(r"^https?://(www\.)?", "", link).rstrip("/")
+            send_error_message(sender_id, short, reply_to_mid=original_mid)
+            if description:
+                send_error_message(sender_id, f"Closest match: {description}",
+                                   reply_to_mid=original_mid)
+            return {"message": "Link then description"}
 
         if link and _send_video(sender_id, link, reply_to_mid=original_mid):
             return {"message": "Reel sent"}
